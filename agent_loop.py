@@ -1,3 +1,4 @@
+import difflib
 import json
 import os
 import re
@@ -31,6 +32,14 @@ CONVERGENCE_EPS = 0.002
 CONVERGENCE_N = 3
 PER_ITERATION_TIMEOUT_SEC = 5 * 60  # FM baseline is ~40s; kill slow/hung candidates fast to save budget
 
+# Tunable heuristic, NOT a hard scientific cutoff. The honest FM baseline's
+# validation-minus-test primary gap is ~0.006. A candidate whose gap is several
+# times that has almost certainly computed a statistic / bucket edge / vocabulary
+# using valid or test rows (leakage), inflating validation while test stays flat.
+# Candidates exceeding this gap are NOT accepted as the new best (see main()).
+# Raise or lower it if the guard fires too often or never.
+LEAKAGE_GAP_THRESHOLD = 0.02
+
 # Fill in MODEL once you've checked GET /v1/models for what's available.
 MODEL = "qwen3-coder-next"
 API_BASE_URL = os.environ.get("SOCLAAS_BASE_URL")
@@ -48,6 +57,21 @@ class Iteration:
     code_path: Path
     metrics: dict = field(default_factory=dict)
     error: Optional[str] = None
+    # Deterministic one-line verdict for this iteration, derived by our own code
+    # (never an extra LLM call). Holds the "REJECTED: suspected leakage, ..."
+    # string when the leakage guard fires, otherwise a summary such as
+    # "Improved valid primary by +0.0025 -- new best 0.6040" / "Failed: <error>"
+    # / "No improvement, within noise (...)". See summarize_evaluation().
+    evaluation: Optional[str] = None
+    # Source-attribution fields parsed from the LLM's plain-text response
+    # (same mechanism as `hypothesis`): a short stable direction label used by
+    # the anti-repetition guardrail, where the idea came from, and notes handed
+    # to the next iteration.
+    direction: Optional[str] = None
+    source: Optional[str] = None
+    next_notes: Optional[str] = None
+    # unified_diff(best_pipeline.py -> this candidate), joined into one string.
+    code_diff: Optional[str] = None
     duration_sec: float = 0.0
 
 
@@ -348,6 +372,36 @@ Your candidate script MUST:
   to_native, evaluate, load, encode) have been the single most common cause
   of past iteration failures. Before finalizing, check every name you use
   is actually imported at the top of the script.
+- NEVER LEAK VALID/TEST DATA INTO STATISTICS, THRESHOLDS, OR ENCODING.
+  Any statistic, threshold, quantile/bucket edge, vocabulary, id->index map,
+  normalization constant, or lookup table that your candidate COMPUTES and
+  then applies to rows MUST be derived from splits['train'] ONLY. Never
+  compute one of these from splits['valid'] or splits['test'], from any
+  concatenation that includes them (e.g. train+valid, or all three), or
+  indirectly (e.g. an expanding per-user accumulator that is updated while
+  looping over valid/test rows, so each valid row sees other valid rows).
+  The official encode() in data.py already does this correctly for the base
+  FIELDS: it fits every field's vocabulary from splits['train'] alone, and
+  any category first seen in valid/test maps to a shared UNK slot. ANY new
+  feature you add MUST follow that identical pattern -- fit on train, apply
+  to valid/test, route unseen values to UNK.
+  Concrete examples of LEAKAGE (all forbidden):
+    * item or user popularity / long-view rate computed with a Counter over
+      splits['train'] + splits['valid'] + splits['test'] (or train+valid)
+      instead of splits['train'] only;
+    * np.quantile(values, q) to pick bucket edges where `values` spans the
+      full dataset (or train+valid) rather than just the train split;
+    * building a new categorical feature's id->index map from the union of
+      all three splits, so valid/test-only categories get their own index
+      instead of falling into UNK;
+    * a running / time-decayed / expanding per-user statistic whose
+      accumulator keeps updating as you iterate over valid or test rows.
+  A candidate whose validation primary is far above its test primary is
+  almost always leaking. The loop now AUTO-REJECTS any candidate whose
+  (valid primary - test primary) gap exceeds ~0.02 -- the honest baseline
+  gap is ~0.006 -- keeping the previous best instead. A leaky candidate
+  therefore cannot win; it only wastes an iteration. Build the feature
+  correctly (train-only) the first time.
 - AVOID LOCAL-OPTIMUM COLLAPSE. If the recent iteration history below shows
   several consecutive attempts clustering within ~0.002 of each other and
   only tuning a numeric knob (temperature, clipping threshold, smoothing
@@ -357,29 +411,103 @@ Your candidate script MUST:
   direction from the ranked list above -- prioritize #2 (user history /
   sequence modeling) or #3 (multi-task learning), since those change what
   the model can represent rather than how its existing output is scaled.
+- ANTI-REPETITION ACROSS DIRECTIONS (hard rule). Each history line below is
+  tagged with the DIRECTION that iteration pursued. If the TWO most recent
+  iterations share the same DIRECTION and NEITHER of them improved on the
+  running best validation primary, you MUST choose a DIFFERENT DIRECTION this
+  iteration. A direction whose last two consecutive attempts both failed to
+  improve is demonstrably not working right now, however promising it seems
+  in principle or however standard the advice is -- do not open your
+  HYPOTHESIS with "since the top-ranked direction is ..." and return to it
+  anyway. If a line in this prompt says "ANTI-REPETITION RULE IS ACTIVE",
+  that condition has already been detected for you and the named DIRECTION is
+  forbidden this iteration. Your DIRECTION line is the on-record evidence of
+  whether you followed this rule.
 
 Respond in EXACTLY this plain-text format, no JSON, nothing else outside it:
 
+DIRECTION: <one line, no prose: a short stable lowercase label for the
+research direction this iteration pursues. Reuse one of these EXACT labels
+when it fits: loss-mismatch, user-history, multi-task, watch-time,
+architecture, time-features, unbiased-eval, calibration. Only invent a new
+short hyphenated label if none fit. The anti-repetition rule above compares
+these labels, so keep the label for a given approach identical across
+iterations.>
+SOURCE: <one line: where this specific idea came from -- e.g. "ranked
+direction #2", "iter 14 NEXT_NOTES", "own reasoning: <a few words>",
+"CONFIRMED DEAD END #3 rules out X so trying Y".>
 HYPOTHESIS: <one or two sentences -- what you're changing and why, tied to
-one of the ranked directions above or your own reasoning>
+the DIRECTION above.>
 
 ```python
 <the full candidate script as described above>
 ```
 
+NEXT_NOTES: <one to three sentences addressed to the NEXT iteration: what
+this change rules in or out, and the single most promising thing to try
+next.>
+
 Do not wrap the whole response in JSON -- source code inside a JSON string
 is error-prone (unescaped quotes/newlines routinely break JSON parsing).
 Only the code itself goes inside the ```python fence; everything else is
-plain text."""
+plain text. DIRECTION, SOURCE and HYPOTHESIS come before the fence,
+NEXT_NOTES after it."""
 
 
-def propose_next_iteration(current_code: str, history: list[Iteration], data_profile: str) -> tuple[str, str]:
-    history_summary = "\n".join(
-        f"Iter {h.index}: {h.hypothesis} -> "
-        + (f"valid.primary={h.metrics.get('valid', {}).get('primary')}" if not h.error
-           else f"ERROR: {h.error[:300]}")
-        for h in history[-6:]
+HISTORY_RECENT_N = 8  # regular recency window shown to the LLM each iteration
+
+
+def _history_for_prompt(history: list[Iteration], n_recent: int = HISTORY_RECENT_N) -> list[Iteration]:
+    """The last `n_recent` iterations PLUS every iteration ever rejected for
+    suspected leakage -- even if it has aged out of the recency window -- so the
+    model keeps seeing a leaky pattern it already got caught on and stops
+    repeating it. Deduplicated by index, sorted by index."""
+    keep = {h.index: h for h in history[-n_recent:]}
+    for h in history:
+        if h.evaluation and "leakage" in h.evaluation.lower():
+            keep[h.index] = h
+    return [keep[i] for i in sorted(keep)]
+
+
+def _history_line(h: Iteration) -> str:
+    d = f"[DIRECTION: {h.direction}] " if h.direction else "[DIRECTION: ?] "
+    if h.error:
+        return f"Iter {h.index}: {d}{h.hypothesis} -> ERROR: {h.error[:200]}"
+    vp = h.metrics.get("valid", {}).get("primary")
+    tp = h.metrics.get("test", {}).get("primary")
+    verdict = f" | {h.evaluation}" if h.evaluation else ""
+    return f"Iter {h.index}: {d}{h.hypothesis} -> valid.primary={vp} test.primary={tp}{verdict}"
+
+
+def _norm_direction(s: Optional[str]) -> str:
+    """Loose-normalise a DIRECTION label for equality checks (compare intent,
+    not exact spelling): lowercase, non-alphanumerics collapsed to hyphens."""
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").strip().lower()).strip("-")
+
+
+def _anti_repetition_note(history: list[Iteration]) -> str:
+    """If the two most recent iterations share a DIRECTION and neither became a
+    new best (evaluation starts with 'Improved'), return a line telling the
+    model that DIRECTION is off-limits this iteration. Empty string otherwise."""
+    if len(history) < 2:
+        return ""
+    a, b = history[-2], history[-1]
+    da, db = _norm_direction(a.direction), _norm_direction(b.direction)
+    if not da or da != db:
+        return ""
+    improved = any(str(h.evaluation or "").startswith("Improved") for h in (a, b))
+    if improved:
+        return ""
+    return (
+        f'\nANTI-REPETITION RULE IS ACTIVE: iterations {a.index} and {b.index} both used '
+        f'DIRECTION "{a.direction}" and neither improved on the best validation primary. '
+        f'You MUST pick a DIRECTION whose normalised label differs from "{a.direction}" '
+        f'this iteration.\n'
     )
+
+
+def propose_next_iteration(current_code: str, history: list[Iteration], data_profile: str) -> tuple[dict, str]:
+    history_summary = "\n".join(_history_line(h) for h in _history_for_prompt(history))
     user_msg = f"""GROUND-TRUTH DATA PROFILE (computed directly from the real data, not a description —
 trust this over any assumption you'd otherwise make):
 {data_profile}
@@ -391,7 +519,7 @@ Current best pipeline code:
 
 Recent iteration history:
 {history_summary or '(none yet)'}
-
+{_anti_repetition_note(history)}
 Propose the next single focused change."""
 
     resp = client.chat.completions.create(
@@ -404,25 +532,45 @@ Propose the next single focused change."""
     )
     text = resp.choices[0].message.content.strip()
 
-    hyp_match = re.search(r"HYPOTHESIS:\s*(.+?)(?=\n```|\Z)", text, re.DOTALL)
+    def _field(label: str, others: list) -> Optional[str]:
+        stop = "|".join([o + ":" for o in others] + [r"```"])
+        m = re.search(rf"^{label}:\s*(.+?)(?=\n(?:{stop})|\Z)", text, re.DOTALL | re.MULTILINE)
+        return m.group(1).strip() if m else None
+
+    direction = _field("DIRECTION", ["SOURCE", "HYPOTHESIS", "NEXT_NOTES"])
+    source = _field("SOURCE", ["DIRECTION", "HYPOTHESIS", "NEXT_NOTES"])
+    hypothesis = _field("HYPOTHESIS", ["DIRECTION", "SOURCE", "NEXT_NOTES"])
+    next_notes = _field("NEXT_NOTES", ["DIRECTION", "SOURCE", "HYPOTHESIS"])
     code_match = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
 
-    if not hyp_match or not code_match:
+    # DIRECTION + HYPOTHESIS + code are required (DIRECTION drives the
+    # anti-repetition guardrail); SOURCE / NEXT_NOTES are best-effort.
+    if not hypothesis or not direction or not code_match:
         raise ValueError(
-            "Could not parse LLM response into hypothesis + code "
-            f"(hypothesis_found={bool(hyp_match)}, code_found={bool(code_match)}). "
-            f"First 500 chars of raw response:\n{text[:500]}"
+            "Could not parse LLM response into direction + hypothesis + code "
+            f"(direction={bool(direction)}, hypothesis={bool(hypothesis)}, "
+            f"code={bool(code_match)}). First 500 chars of raw response:\n{text[:500]}"
         )
 
-    hypothesis = hyp_match.group(1).strip()
-    candidate_code = code_match.group(1)
-    return hypothesis, candidate_code
+    proposal = {
+        "hypothesis": hypothesis,
+        "direction": direction,
+        "source": source or "(not provided)",
+        "next_notes": next_notes or "(not provided)",
+    }
+    return proposal, code_match.group(1)
 
 
 # ---- Convergence ----------------------------------------------------------
 
 def has_converged(history: list[Iteration]) -> bool:
-    scored = [h for h in history if h.error is None]
+    # A candidate rejected for suspected leakage carries an inflated validation
+    # primary and must not anchor the convergence test. (`evaluation` is now
+    # populated for every iteration with a deterministic verdict, so test for
+    # the REJECTED prefix specifically rather than for None -- same effect as
+    # before for the leakage guard.)
+    scored = [h for h in history
+              if h.error is None and not str(h.evaluation or "").startswith("REJECTED")]
     if len(scored) < CONVERGENCE_N + 1:
         return False
     recent = scored[-(CONVERGENCE_N + 1):]
@@ -431,6 +579,44 @@ def has_converged(history: list[Iteration]) -> bool:
         for i in range(len(recent) - 1)
     ]
     return all(abs(d) <= CONVERGENCE_EPS for d in deltas)
+
+
+def summarize_evaluation(iteration: Iteration, best_before: float) -> str:
+    """Deterministic one-line verdict from this iteration's own metrics/error
+    plus the running best it was compared against -- no extra LLM call. NOT
+    called when iteration.evaluation is already set (e.g. a leakage REJECTION),
+    so that guard's string is never clobbered. 'Improved ...' is emitted iff the
+    iteration became the new best, which is exactly what the anti-repetition
+    guardrail keys on."""
+    if iteration.error:
+        return f"Failed: {iteration.error.strip().splitlines()[-1][:200]}"
+    vp = iteration.metrics.get("valid", {}).get("primary")
+    if vp is None:
+        return "Failed: result had no valid primary"
+    delta = vp - best_before
+    if delta > 0:
+        within = " (within noise)" if delta <= CONVERGENCE_EPS else ""
+        return f"Improved valid primary by {delta:+.4f}{within} -- new best {vp:.4f}"
+    if abs(delta) <= CONVERGENCE_EPS:
+        return f"No improvement, within noise ({delta:+.4f} vs best {best_before:.4f})"
+    return f"No improvement, regression ({delta:+.4f} vs best {best_before:.4f})"
+
+
+def append_log(iteration: Iteration):
+    """Single writer for run_log.jsonl so every entry carries the same schema."""
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps({
+            "index": iteration.index,
+            "hypothesis": iteration.hypothesis,
+            "direction": iteration.direction,
+            "source": iteration.source,
+            "metrics": iteration.metrics,
+            "error": iteration.error,
+            "evaluation": iteration.evaluation,
+            "code_diff": iteration.code_diff,
+            "next_notes": iteration.next_notes,
+            "duration_sec": iteration.duration_sec,
+        }) + "\n")
 
 
 # ---- Main loop --------------------------------------------------------------
@@ -450,22 +636,20 @@ def main():
     print("Scoring bootstrap baseline (iteration 0)...")
     t0 = time.time()
     baseline_res = run_pipeline(load_current_pipeline_code())
+    best_valid_primary = baseline_res["valid"]["primary"]
     iteration0 = Iteration(
         index=0, hypothesis="Bootstrap: official FM baseline, unmodified.",
         code_path=BEST_CODE_PATH, metrics=baseline_res, duration_sec=time.time() - t0,
+        direction="baseline", source="bootstrap (no LLM call)",
+        next_notes="Reference score; every later iteration is measured against this.",
+        evaluation=f"Baseline established (valid primary {best_valid_primary:.4f})",
     )
     history.append(iteration0)
-    best_valid_primary = baseline_res["valid"]["primary"]
     # Iteration 0 is the incumbent best until something beats it, so its test
     # scores are the submission fallback if every later candidate fails.
     capture_best_test_scores(0)
     print(f"  baseline valid.primary={best_valid_primary:.4f} test.primary={baseline_res['test']['primary']:.4f}")
-    with LOG_PATH.open("a") as f:
-        f.write(json.dumps({
-            "index": 0, "hypothesis": iteration0.hypothesis,
-            "metrics": iteration0.metrics, "error": None,
-            "duration_sec": iteration0.duration_sec,
-        }) + "\n")
+    append_log(iteration0)
 
     for i in range(1, MAX_ITERATIONS):
         if time.time() - start_time > WALL_CLOCK_LIMIT_SEC:
@@ -476,7 +660,7 @@ def main():
 
         t0 = time.time()
         try:
-            hypothesis, candidate_code = propose_next_iteration(current_code, history, data_profile)
+            proposal, candidate_code = propose_next_iteration(current_code, history, data_profile)
         except Exception as e:  # noqa: BLE001 -- a bad/malformed LLM response must not kill the run
             iteration = Iteration(
                 index=i, hypothesis="(LLM proposal step failed)",
@@ -484,28 +668,50 @@ def main():
                 error=f"propose_next_iteration failed: {e}",
                 duration_sec=time.time() - t0,
             )
+            iteration.evaluation = summarize_evaluation(iteration, best_valid_primary)
             print(f"[iter {i}] PROPOSAL ERROR: {e}")
             history.append(iteration)
-            with LOG_PATH.open("a") as f:
-                f.write(json.dumps({
-                    "index": iteration.index, "hypothesis": iteration.hypothesis,
-                    "metrics": iteration.metrics, "error": iteration.error,
-                    "duration_sec": iteration.duration_sec,
-                }) + "\n")
+            append_log(iteration)
             continue
 
-        iteration = Iteration(index=i, hypothesis=hypothesis, code_path=WORKDIR / "candidate_pipeline.py")
+        hypothesis = proposal["hypothesis"]
+        code_diff = "".join(difflib.unified_diff(
+            current_code.splitlines(keepends=True),
+            candidate_code.splitlines(keepends=True),
+            fromfile="best_pipeline.py", tofile=f"candidate_iter_{i}.py",
+        ))
+        iteration = Iteration(
+            index=i, hypothesis=hypothesis, code_path=WORKDIR / "candidate_pipeline.py",
+            direction=proposal["direction"], source=proposal["source"],
+            next_notes=proposal["next_notes"], code_diff=code_diff,
+        )
+        prev_best = best_valid_primary
         try:
             res = run_pipeline(candidate_code)
             iteration.metrics = res
             iteration.duration_sec = time.time() - t0
             vp = res["valid"]["primary"]
+            tp = res.get("test", {}).get("primary")
+            tp_str = f"{tp:.4f}" if tp is not None else "n/a"
+            gap = (vp - tp) if tp is not None else None
 
-            if vp > best_valid_primary:
+            if gap is not None and gap > LEAKAGE_GAP_THRESHOLD:
+                # Suspected train/valid/test leakage: validation primary sits far
+                # above test primary (honest gap ~0.006). Do NOT accept as the new
+                # best even though vp is higher -- keep the previous best. This is
+                # a tunable heuristic (LEAKAGE_GAP_THRESHOLD), not a hard cutoff.
+                iteration.evaluation = (
+                    f"REJECTED: suspected leakage, valid-test gap {gap:.4f} "
+                    f"exceeds {LEAKAGE_GAP_THRESHOLD}"
+                )
+                print(f"[iter {i}] REJECTED (suspected leakage): valid.primary={vp:.4f} "
+                      f"test.primary={tp_str} gap={gap:.4f} > {LEAKAGE_GAP_THRESHOLD}; "
+                      f"best stays {best_valid_primary:.4f} -- {hypothesis}")
+            elif vp > best_valid_primary:
                 best_valid_primary = vp
                 BEST_CODE_PATH.write_text(candidate_code)
                 capture_best_test_scores(i)
-                print(f"[iter {i}] NEW BEST valid.primary={vp:.4f} test.primary={res['test']['primary']:.4f} -- {hypothesis}")
+                print(f"[iter {i}] NEW BEST valid.primary={vp:.4f} test.primary={tp_str} -- {hypothesis}")
             else:
                 print(f"[iter {i}] valid.primary={vp:.4f} (best={best_valid_primary:.4f}) -- {hypothesis}")
 
@@ -514,15 +720,13 @@ def main():
             iteration.duration_sec = time.time() - t0
             print(f"[iter {i}] ERROR: {e}")
 
+        # Deterministic verdict for the log. A leakage REJECTION is already set
+        # above and must not be overwritten.
+        if not iteration.evaluation:
+            iteration.evaluation = summarize_evaluation(iteration, prev_best)
+
         history.append(iteration)
-        with LOG_PATH.open("a") as f:
-            f.write(json.dumps({
-                "index": iteration.index,
-                "hypothesis": iteration.hypothesis,
-                "metrics": iteration.metrics,
-                "error": iteration.error,
-                "duration_sec": iteration.duration_sec,
-            }) + "\n")
+        append_log(iteration)
 
         if has_converged(history):
             print(f"Converged after {i + 1} iterations (incl. bootstrap).")
@@ -605,10 +809,15 @@ def best_logged_test_primary():
             if not line:
                 continue
             try:
-                m = (json.loads(line).get("metrics") or {})
-                vp, tp = m.get("valid", {}).get("primary"), m.get("test", {}).get("primary")
-            except (ValueError, AttributeError):
+                entry = json.loads(line)
+            except ValueError:
                 continue
+            # A rejected (suspected-leakage) iteration never produced
+            # best_test_scores.npy, so it can't be the submission source.
+            if str(entry.get("evaluation") or "").startswith("REJECTED"):
+                continue
+            m = entry.get("metrics") or {}
+            vp, tp = m.get("valid", {}).get("primary"), m.get("test", {}).get("primary")
             if vp is not None and vp > best_valid:
                 best_valid, best_test = vp, tp
     return best_test
@@ -636,19 +845,24 @@ def print_run_summary():
     baseline_valid = None
     best_idx, best_valid = None, -1.0
 
-    print(f"{'#':>3} {'status':<8} {'valid':>8} {'test':>8} {'Δvalid':>8} {'time':>7}  hypothesis")
-    print("-" * 100)
+    print(f"{'#':>3} {'status':<7} {'valid':>8} {'test':>8} {'Δvalid':>8} {'time':>7} "
+          f"{'direction':<14} hypothesis")
+    print("-" * 108)
 
     for it in iters:
         idx = it["index"]
         err = it.get("error")
-        status = "OK" if not err else "ERROR"
+        evaluation = it.get("evaluation")
+        rejected = bool(evaluation) and evaluation.startswith("REJECTED")
+        status = "ERROR" if err else ("REJECT" if rejected else "OK")
         valid_p = (it.get("metrics") or {}).get("valid", {}).get("primary")
         dur = it.get("duration_sec", 0)
+        direction = (it.get("direction") or "-")[:14]
 
         if idx == 0 and valid_p is not None:
             baseline_valid = valid_p
-        if valid_p is not None and valid_p > best_valid:
+        # A rejected (suspected-leakage) iteration must never count as "best".
+        if valid_p is not None and not rejected and valid_p > best_valid:
             best_valid, best_idx = valid_p, idx
 
         delta = ""
@@ -656,17 +870,29 @@ def print_run_summary():
             delta = f"{valid_p - baseline_valid:+.4f}"
 
         hyp = it.get("hypothesis", "")
-        hyp_short = (hyp[:75] + "...") if len(hyp) > 78 else hyp
+        hyp_short = (hyp[:72] + "...") if len(hyp) > 75 else hyp
+        # One compact continuation line: error / leakage verdict / source.
+        cont = None
         if err:
-            err_short = err.strip().splitlines()[-1][:75]
-            hyp_short = f"{hyp_short}\n{'':>39}⤷ {err_short}"
+            cont = err.strip().splitlines()[-1][:78]
+        elif rejected:
+            cont = evaluation[:78]
+        elif it.get("source") and it.get("source") != "(not provided)":
+            cont = f"src: {it['source'][:74]}"
+        if cont:
+            hyp_short = f"{hyp_short}\n{'':>49}⤷ {cont}"
 
-        print(f"{idx:>3} {status:<8} {fmt_primary(it,'valid'):>8} {fmt_primary(it,'test'):>8} "
-              f"{delta:>8} {dur:>6.1f}s  {hyp_short}")
+        print(f"{idx:>3} {status:<7} {fmt_primary(it,'valid'):>8} {fmt_primary(it,'test'):>8} "
+              f"{delta:>8} {dur:>6.1f}s {direction:<14} {hyp_short}")
 
-    print("-" * 100)
-    n_ok = sum(1 for it in iters if not it.get("error"))
-    print(f"{len(iters)} iterations: {n_ok} succeeded, {len(iters) - n_ok} errored.")
+    print("-" * 108)
+    n_rej = sum(1 for it in iters
+                if str(it.get("evaluation") or "").startswith("REJECTED"))
+    n_ok = sum(1 for it in iters if not it.get("error")
+               and not str(it.get("evaluation") or "").startswith("REJECTED"))
+    tail = f", {n_rej} rejected (suspected leakage)" if n_rej else ""
+    print(f"{len(iters)} iterations: {n_ok} succeeded, "
+          f"{len(iters) - n_ok - n_rej} errored{tail}.")
     if best_idx is not None:
         print(f"Best so far: iteration {best_idx} (valid primary {best_valid:.4f}, "
               f"baseline was {baseline_valid:.4f})")
