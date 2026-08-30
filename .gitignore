@@ -1,1 +1,18 @@
+# Secrets
 .env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Agent-loop generated artifacts, rebuilt on every run of agent_loop.py.
+# (best_pipeline.py, run_log.jsonl, submission.csv and workdir/_agent_utils.py
+# are deliberately kept tracked as deliverables / solution components.)
+best_test_scores.npy
+# verbatim runtime copy of ./submit.py
+workdir/submit.py
+# raw test scores dropped by each candidate before promotion
+workdir/test_scores.npy
+# per-iteration LLM scratch, rewritten every iteration
+workdir/candidate_pipeline.py

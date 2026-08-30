@@ -19,6 +19,8 @@ ROOT = Path(__file__).parent
 WORKDIR = ROOT / "workdir"
 LOG_PATH = ROOT / "run_log.jsonl"
 BEST_CODE_PATH = ROOT / "best_pipeline.py"
+BEST_TEST_SCORES_PATH = ROOT / "best_test_scores.npy"
+SUBMISSION_PATH = ROOT / "submission.csv"
 
 # Adjust if your data lives elsewhere. Passed to candidate scripts via env var.
 DATA_DIR = ROOT / "KuaiRand-Pure" / "data"
@@ -57,11 +59,26 @@ BOOTSTRAP_FOOTER = '''
 if __name__ == "__main__":
     import json, os
     from data import load
-    from _agent_utils import to_native
+    from _agent_utils import to_native, save_test_scores
     splits = load(os.environ["KUAIRAND_DATA_DIR"])
     res = run_fm(splits, k=16, lr=0.001, epochs=40, seed=0, verbose=False)
+    # Raw test predictions are a big ndarray -- not JSON-safe even through
+    # to_native() -- so pop them out and persist them separately.
+    save_test_scores(res.pop("_test_scores"))
     print("RESULT_JSON:" + json.dumps(to_native(res)))
 '''
+
+# The one deliberate additive deviation from baseline.py: run_fm() as shipped
+# returns only evaluate() dicts, discarding the raw test-split scores we need
+# to build submission.csv. Patch exactly that return block -- everything else
+# stays byte-for-byte identical to the real file.
+_BASELINE_RETURN_SRC = """    return {'valid': evaluate(uva, yva, m.predict(Xva)),
+            'test':  evaluate(ute, yte, m.predict(Xte))}"""
+
+_BASELINE_RETURN_PATCHED = """    _test_scores = m.predict(Xte)
+    return {'valid': evaluate(uva, yva, m.predict(Xva)),
+            'test':  evaluate(ute, yte, _test_scores),
+            '_test_scores': _test_scores}"""
 
 
 def build_bootstrap_code() -> str:
@@ -69,16 +86,27 @@ def build_bootstrap_code() -> str:
     verbatim (FM class, run_fm, etc.) rather than a hand-copied duplicate --
     this can never drift from the real file, unlike a manually retyped copy.
     Only baseline.py's own CLI entry point (argparse, its own __main__ block)
-    is dropped, since we append our own minimal runner instead."""
+    is dropped, since we append our own minimal runner instead, plus one
+    targeted patch to run_fm's return so raw test scores are exposed."""
     src = (WORKDIR / "baseline.py").read_text()
     marker = "if __name__ == '__main__':"
     if marker in src:
         src = src.split(marker)[0]
+
+    if src.count(_BASELINE_RETURN_SRC) != 1:
+        raise RuntimeError(
+            "Could not patch run_fm's return block in workdir/baseline.py: expected "
+            f"exactly one occurrence of the known return statement, found "
+            f"{src.count(_BASELINE_RETURN_SRC)}. baseline.py has changed shape -- "
+            "update _BASELINE_RETURN_SRC to match it before rerunning."
+        )
+    src = src.replace(_BASELINE_RETURN_SRC, _BASELINE_RETURN_PATCHED)
     return src + BOOTSTRAP_FOOTER
 
 
 AGENT_UTILS_CODE = '''"""Fixed helper module, not LLM-generated. Available to every candidate
-script as `from _agent_utils import to_native`."""
+script as `from _agent_utils import to_native, save_test_scores`."""
+import numpy as np
 
 def to_native(x):
     """Recursively cast numpy scalars to native Python types for JSON."""
@@ -89,7 +117,26 @@ def to_native(x):
     if hasattr(x, "item"):  # numpy scalar (float32, int64, etc.)
         return x.item()
     return x
+
+def save_test_scores(scores):
+    """Save this script's raw test-split prediction scores, in the same row
+    order as data.load(...)['test'], so the winning iteration's scores can
+    be turned into submission.csv afterward. Call this once, right before
+    printing RESULT_JSON, passing the EXACT SAME array you passed as
+    `scores` when calling evaluate(...) on the test split."""
+    np.save("test_scores.npy", np.asarray(scores, dtype=np.float64))
 '''
+
+
+def sync_submit_module():
+    """Mirror the kit's own submit.py into workdir/ so write_submission_csv()
+    can import its write_submission() directly instead of reimplementing the
+    submission CSV format. Copied verbatim — submit.py is a fixed kit file."""
+    src = ROOT / "submit.py"
+    if not src.exists():
+        return False
+    (WORKDIR / "submit.py").write_bytes(src.read_bytes())
+    return True
 
 
 def bootstrap_pipeline():
@@ -98,6 +145,7 @@ def bootstrap_pipeline():
     inherit a previous run's best_pipeline.py, even if one is on disk."""
     (WORKDIR / "_agent_utils.py").write_text(AGENT_UTILS_CODE)
     BEST_CODE_PATH.write_text(build_bootstrap_code())
+    sync_submit_module()
 
 
 def load_current_pipeline_code() -> str:
@@ -139,6 +187,13 @@ def run_pipeline(code: str) -> dict:
     scratch = WORKDIR / "candidate_pipeline.py"
     scratch.write_text(code)
 
+    # Clear any previous iteration's scores first: if this candidate fails to
+    # write its own, we must NOT silently promote a stale file belonging to a
+    # different model as if it were this iteration's output.
+    stale_scores = WORKDIR / "test_scores.npy"
+    if stale_scores.exists():
+        stale_scores.unlink()
+
     env = dict(os.environ)
     env["KUAIRAND_DATA_DIR"] = str(DATA_DIR.resolve())
 
@@ -164,6 +219,19 @@ def run_pipeline(code: str) -> dict:
     if "valid" not in res or "primary" not in res["valid"]:
         raise RuntimeError(f"RESULT_JSON missing valid/primary: {payload[:500]}")
     return res
+
+
+def capture_best_test_scores(iter_index: int):
+    """Promote the iteration that just ran — now the best-scoring one — from
+    workdir/test_scores.npy to the persistent ROOT/best_test_scores.npy, so a
+    later iteration overwriting workdir can't destroy the winner's scores.
+    Plain file-byte copy, so numpy/shutil stay out of this module's imports."""
+    scores_path = WORKDIR / "test_scores.npy"
+    if not scores_path.exists():
+        print(f"[iter {iter_index}] WARNING: no test_scores.npy produced -- this "
+              f"iteration's scores won't be available for submission generation.")
+        return
+    BEST_TEST_SCORES_PATH.write_bytes(scores_path.read_bytes())
 
 
 # ---- LLM proposal step ----------------------------------------------------
@@ -193,8 +261,10 @@ FIXED, DO NOT MODIFY — available via local imports in your candidate script:
   -> {'GAUC':.., 'nDCG@5':.., 'primary':.., 'users':.., 'rows':..}. This is
   the ONLY scoring function that counts — never reimplement it.
 - Data directory is at os.environ["KUAIRAND_DATA_DIR"]; call load(that path).
-- `from _agent_utils import to_native` — recursively casts numpy scalars to
-  native Python types; use before any json.dumps() of your results dict.
+- `from _agent_utils import to_native, save_test_scores` — to_native()
+  recursively casts numpy scalars to native Python types (use before any
+  json.dumps() of your results dict); save_test_scores(scores) persists your
+  raw test-split scores for submission generation (see the MUST list below).
 - Only numpy + Python stdlib are available (no torch/pandas/sklearn).
 - Target Python 3.9. Do NOT use 3.10+ syntax such as `X | None` union
   types or `match` statements — use `Optional[X]` from `typing` instead,
@@ -251,6 +321,42 @@ Your candidate script MUST:
 - Complete within a few minutes on a single CPU core (the FM baseline is ~40s).
   Avoid pure-Python loops over the full 1.14M-row training set per epoch --
   vectorize with numpy, the way the existing FM.step() does.
+- SAVE TEST-SPLIT SCORES FOR SUBMISSION — MANDATORY, EVERY ITERATION.
+  Immediately before printing the RESULT_JSON line, call
+  `save_test_scores(scores_test)` (imported from _agent_utils, as shown
+  above). `scores_test` MUST be THE EXACT SAME array you passed as the
+  `scores` argument to evaluate(...) for the test split — not a
+  recomputation, not the valid-split scores, not a rescaled copy. It is a
+  1D array of raw scores (any real numbers, higher = more relevant) with
+  one entry for EVERY row of the test split, in the exact same order as
+  encode(splits)['test'] (which matches splits['test']'s row order).
+  Concretely, structure it like this:
+
+      scores_test = model.predict(Xte)          # your test-split scores
+      res = {'valid': evaluate(uva, yva, scores_valid),
+             'test':  evaluate(ute, yte, scores_test)}
+      save_test_scores(scores_test)             # same array as above
+      print("RESULT_JSON:" + json.dumps(to_native(res)))
+
+  Do NOT put the score array inside the results dict — a large ndarray is
+  not JSON-serializable and will crash json.dumps(). Do this unconditionally
+  on every iteration, even though it does not affect your printed metrics:
+  it is what turns the winning iteration into an actual competition
+  submission file afterward, and an iteration that skips it cannot be
+  submitted even if it scores best.
+- VERIFY IMPORTS BEFORE FINISHING. Missing imports (os, json, numpy as np,
+  to_native, evaluate, load, encode) have been the single most common cause
+  of past iteration failures. Before finalizing, check every name you use
+  is actually imported at the top of the script.
+- AVOID LOCAL-OPTIMUM COLLAPSE. If the recent iteration history below shows
+  several consecutive attempts clustering within ~0.002 of each other and
+  only tuning a numeric knob (temperature, clipping threshold, smoothing
+  alpha, learning rate, etc. on the same underlying model), that's a sign
+  you've plateaued on calibration, not found real headroom. In that case
+  you MUST switch to a structurally different, not-yet-seriously-attempted
+  direction from the ranked list above -- prioritize #2 (user history /
+  sequence modeling) or #3 (multi-task learning), since those change what
+  the model can represent rather than how its existing output is scaled.
 
 Respond in EXACTLY this plain-text format, no JSON, nothing else outside it:
 
@@ -350,6 +456,9 @@ def main():
     )
     history.append(iteration0)
     best_valid_primary = baseline_res["valid"]["primary"]
+    # Iteration 0 is the incumbent best until something beats it, so its test
+    # scores are the submission fallback if every later candidate fails.
+    capture_best_test_scores(0)
     print(f"  baseline valid.primary={best_valid_primary:.4f} test.primary={baseline_res['test']['primary']:.4f}")
     with LOG_PATH.open("a") as f:
         f.write(json.dumps({
@@ -395,6 +504,7 @@ def main():
             if vp > best_valid_primary:
                 best_valid_primary = vp
                 BEST_CODE_PATH.write_text(candidate_code)
+                capture_best_test_scores(i)
                 print(f"[iter {i}] NEW BEST valid.primary={vp:.4f} test.primary={res['test']['primary']:.4f} -- {hypothesis}")
             else:
                 print(f"[iter {i}] valid.primary={vp:.4f} (best={best_valid_primary:.4f}) -- {hypothesis}")
@@ -423,6 +533,85 @@ def main():
     print(f"Full run log at: {LOG_PATH}")
     print()
     print_run_summary()
+    print()
+    try:
+        write_submission_csv()
+    except Exception as e:  # noqa: BLE001 -- a failed submission write must not
+        # discard a completed run; best_pipeline.py and best_test_scores.npy are
+        # already on disk, so this can be retried standalone afterward.
+        print(f"Submission generation failed: {e}")
+        print("The run itself is intact -- retry with:\n"
+              '  python3 -c "from agent_loop import write_submission_csv; write_submission_csv()"')
+
+
+def write_submission_csv():
+    """Build submission.csv from the winning iteration's saved test-split
+    scores. The CSV format is NOT reimplemented here -- submit.py's own
+    write_submission() is imported and called, so the file we produce can
+    never drift from the format its read_submission() checker enforces."""
+    if not BEST_TEST_SCORES_PATH.exists():
+        print("No best_test_scores.npy found -- no scored iteration ever saved "
+              "test scores. No submission.csv was generated. To submit the "
+              "official baseline instead, run the kit's own generator:\n"
+              f"  python3 submit.py --make --split test {SUBMISSION_PATH.name}")
+        return
+
+    import importlib
+    import numpy as np
+
+    if str(WORKDIR) not in sys.path:
+        sys.path.insert(0, str(WORKDIR))
+    if not (WORKDIR / "submit.py").exists() and not sync_submit_module():
+        print("Cannot generate submission.csv: submit.py not found at "
+              f"{ROOT / 'submit.py'} -- copy it in from the official starter kit.")
+        return
+
+    data_mod = importlib.import_module("data")
+    submit_mod = importlib.import_module("submit")
+
+    splits = data_mod.load(str(DATA_DIR.resolve()))
+    rows = splits["test"]
+    scores = np.load(BEST_TEST_SCORES_PATH)
+
+    if len(scores) != len(rows):
+        print(f"WARNING: best_test_scores.npy has {len(scores)} rows but the test "
+              f"split has {len(rows)} rows -- these must match exactly. NOT writing "
+              f"submission.csv; investigate the winning iteration before submitting.")
+        return
+
+    submit_mod.write_submission(str(SUBMISSION_PATH), rows, scores)
+
+    print(f"Wrote {SUBMISSION_PATH} ({len(rows):,d} rows) from the best "
+          f"iteration's saved test scores, via submit.py's write_submission().")
+    print("Verify independently with the official checker before submitting "
+          f"(run from {ROOT}):")
+    print(f"  python3 submit.py --check --split test {SUBMISSION_PATH.name}   # format + row alignment")
+    expect = best_logged_test_primary()
+    note = (f"# should reprint test primary {expect:.4f}" if expect is not None
+            else "# rescores the file end-to-end")
+    print(f"  python3 submit.py --score --split test {SUBMISSION_PATH.name}   {note}")
+
+
+def best_logged_test_primary():
+    """Test primary of the run's best-by-validation iteration, per run_log.jsonl.
+    Used only to print an expected value alongside the --score command, so a
+    mismatch between the written CSV and the reported metric is obvious."""
+    if not LOG_PATH.exists():
+        return None
+    best_valid, best_test = -1.0, None
+    with LOG_PATH.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = (json.loads(line).get("metrics") or {})
+                vp, tp = m.get("valid", {}).get("primary"), m.get("test", {}).get("primary")
+            except (ValueError, AttributeError):
+                continue
+            if vp is not None and vp > best_valid:
+                best_valid, best_test = vp, tp
+    return best_test
 
 
 def print_run_summary():
