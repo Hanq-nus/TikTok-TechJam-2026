@@ -27,7 +27,7 @@ BEST_CODE_PATH = ROOT / "best_pipeline.py"
 BEST_TEST_SCORES_PATH = ROOT / "best_test_scores.npy"
 SUBMISSION_PATH = ROOT / "submission.csv"
 
-# Adjust if your data lives elsewhere. Passed to candidate scripts via env var.
+# Passed to candidate scripts via an env var.
 DATA_DIR = ROOT / "KuaiRand-Pure" / "data"
 
 MAX_ITERATIONS = 50
@@ -36,31 +36,28 @@ CONVERGENCE_EPS = 0.002
 CONVERGENCE_N = 3
 PER_ITERATION_TIMEOUT_SEC = 5 * 60  # FM baseline is ~40s; kill slow/hung candidates fast to save budget
 
-# Tunable heuristic, NOT a hard scientific cutoff. The honest FM baseline's
+# Heuristic threshold, not a hard scientific cutoff. The honest FM baseline's
 # validation-minus-test primary gap is ~0.006. A candidate whose gap is several
 # times that has almost certainly computed a statistic / bucket edge / vocabulary
 # using valid or test rows (leakage), inflating validation while test stays flat.
-# Candidates exceeding this gap are NOT accepted as the new best (see main()).
-# Raise or lower it if the guard fires too often or never.
+# Candidates exceeding this gap are not accepted as the new best (see main()).
 LEAKAGE_GAP_THRESHOLD = 0.02
 
 # The valid-test GAP guard above only catches ASYMMETRIC leaks (valid inflated,
 # test not). A feature built from same-split labels for BOTH valid and test
 # inflates both equally and slips past it. Backstop: no legitimate single change
 # in this task has ever moved validation primary more than ~0.0025 at once, so a
-# one-iteration jump bigger than this is auto-rejected for manual review. Tune up
-# if a genuine large gain is ever wrongly rejected.
+# one-iteration jump bigger than this is auto-rejected for manual review.
 LARGE_JUMP_THRESHOLD = 0.015
 
-# When True (default), main() snapshots the submission-critical files
-# (submission.csv, best_pipeline.py, run_log.jsonl, best_test_scores.npy) BEFORE
-# the run touches them, and at the end AUTO-RESTORES them if this run's best test
-# primary did not beat the incumbent. So `python3 agent_loop.py` is safe to run
-# without losing a good committed submission. The run's own log/summary are still
-# kept under runs/. Set False for the old always-overwrite behaviour.
+# When True, main() snapshots the submission-critical files (submission.csv,
+# best_pipeline.py, run_log.jsonl, best_test_scores.npy) before the run touches
+# them and auto-restores them at the end if this run's best test primary did not
+# beat the incumbent, so a run that does not improve cannot lose a good committed
+# submission. The run's own log/summary are still kept under runs/. When False,
+# the run always overwrites those files.
 PROTECT_BEST_SUBMISSION = True
 
-# Fill in MODEL once you've checked GET /v1/models for what's available.
 MODEL = "qwen3-coder-next"
 API_BASE_URL = os.environ.get("API_BASE_URL")
 API_KEY = os.environ.get("API_KEY")
@@ -947,9 +944,8 @@ def main():
 
             if gap is not None and gap > LEAKAGE_GAP_THRESHOLD:
                 # Suspected train/valid/test leakage: validation primary sits far
-                # above test primary (honest gap ~0.006). Do NOT accept as the new
-                # best even though vp is higher -- keep the previous best. This is
-                # a tunable heuristic (LEAKAGE_GAP_THRESHOLD), not a hard cutoff.
+                # above test primary (honest gap ~0.006). Not accepted as the new
+                # best even though vp is higher; the previous best is kept.
                 iteration.evaluation = (
                     f"REJECTED: suspected leakage, valid-test gap {gap:.4f} "
                     f"exceeds {LEAKAGE_GAP_THRESHOLD}"
@@ -960,8 +956,7 @@ def main():
             elif (vp - prev_best) > LARGE_JUMP_THRESHOLD:
                 # Backstop for a symmetric leak the gap check misses: an
                 # implausibly large one-step gain. Not accepted -- flagged for
-                # manual review. Tune LARGE_JUMP_THRESHOLD if a genuine big gain
-                # is ever wrongly caught here.
+                # manual review.
                 iteration.evaluation = (
                     f"REJECTED: implausibly large single-iteration gain "
                     f"(+{vp - prev_best:.4f} vs best {prev_best:.4f}, threshold "
