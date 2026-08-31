@@ -50,6 +50,14 @@ LEAKAGE_GAP_THRESHOLD = 0.02
 # if a genuine large gain is ever wrongly rejected.
 LARGE_JUMP_THRESHOLD = 0.015
 
+# When True (default), main() snapshots the submission-critical files
+# (submission.csv, best_pipeline.py, run_log.jsonl, best_test_scores.npy) BEFORE
+# the run touches them, and at the end AUTO-RESTORES them if this run's best test
+# primary did not beat the incumbent. So `python3 agent_loop.py` is safe to run
+# without losing a good committed submission. The run's own log/summary are still
+# kept under runs/. Set False for the old always-overwrite behaviour.
+PROTECT_BEST_SUBMISSION = True
+
 # Fill in MODEL once you've checked GET /v1/models for what's available.
 MODEL = "qwen3-coder-next"
 API_BASE_URL = os.environ.get("SOCLAAS_BASE_URL")
@@ -819,6 +827,16 @@ def main():
 
     WORKDIR.mkdir(exist_ok=True)
     RUNS_DIR.mkdir(exist_ok=True)
+
+    run_started = time.strftime("%Y-%m-%dT%H:%M:%S")
+    run_id = time.strftime("%Y%m%dT%H%M%S")
+
+    # Snapshot the submission-critical files BEFORE bootstrap overwrites them, so
+    # finalize_submission() can roll back a run that doesn't beat the incumbent.
+    restore_dir = RUNS_DIR / f"_incumbent_{run_id}"
+    incumbent_test_primary = (snapshot_incumbent(restore_dir)
+                              if PROTECT_BEST_SUBMISSION else None)
+
     bootstrap_pipeline()
     _record_best_pipeline_hash()  # the loop just wrote best_pipeline.py
 
@@ -826,8 +844,6 @@ def main():
     # etc. keep working unchanged); a timestamped copy is also kept under runs/
     # so no past run is ever lost. run_number is "files already in runs/ + 1" --
     # best-effort ordering, the timestamp in the name is the real identifier.
-    run_started = time.strftime("%Y-%m-%dT%H:%M:%S")
-    run_id = time.strftime("%Y%m%dT%H%M%S")
     run_number = 1 + len(list(RUNS_DIR.glob("run_log_*.jsonl")))
     archive_path = RUNS_DIR / f"run_log_{run_number:03d}_{run_id}.jsonl"
     _RUN_META.clear()
@@ -1011,14 +1027,7 @@ def main():
         # discard an otherwise-complete run.
         print(f"Run-summary files not written (run is otherwise complete): {e}")
     print()
-    try:
-        write_submission_csv()
-    except Exception as e:  # noqa: BLE001 -- a failed submission write must not
-        # discard a completed run; best_pipeline.py and best_test_scores.npy are
-        # already on disk, so this can be retried standalone afterward.
-        print(f"Submission generation failed: {e}")
-        print("The run itself is intact -- retry with:\n"
-              '  python3 -c "from agent_loop import write_submission_csv; write_submission_csv()"')
+    finalize_submission(summary, incumbent_test_primary, restore_dir)
 
 
 def write_submission_csv():
@@ -1216,6 +1225,141 @@ def print_run_summary(logfile: Optional[Path] = None):
     }
 
 
+# ---- Submission protection --------------------------------------------------
+
+# The files a run overwrites that you might want to submit / keep committed.
+_PROTECTED_FILES = ("submission.csv", "best_pipeline.py", "run_log.jsonl",
+                    "best_test_scores.npy")
+
+
+def _score_submission_test(path: Path) -> Optional[float]:
+    """Independently score an existing submission.csv on the test split (loads
+    data fresh, uses the untouched evaluate()). None if it can't be scored."""
+    if not path.exists():
+        return None
+    try:
+        import importlib
+        if str(WORKDIR) not in sys.path:
+            sys.path.insert(0, str(WORKDIR))
+        if not (WORKDIR / "submit.py").exists():
+            sync_submit_module()
+        data_mod = importlib.import_module("data")
+        submit_mod = importlib.import_module("submit")
+        ev_mod = importlib.import_module("evaluate")
+        rows = data_mod.load(str(DATA_DIR.resolve()))["test"]
+        scores = submit_mod.read_submission(str(path), rows)
+        r = ev_mod.evaluate([x[1] for x in rows], [x[6] for x in rows], scores)
+        return float(r["primary"])
+    except Exception as e:  # noqa: BLE001
+        print(f"  (could not score existing submission.csv: {e})")
+        return None
+
+
+def snapshot_incumbent(restore_dir: Path) -> Optional[float]:
+    """Copy the submission-critical files aside (byte copies) and return the
+    incumbent's best test primary from the not-yet-truncated run_log.jsonl."""
+    incumbent = best_logged_test_primary()
+    restore_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for name in _PROTECTED_FILES:
+        p = ROOT / name
+        if p.exists():
+            (restore_dir / name).write_bytes(p.read_bytes())
+            saved.append(name)
+    where = restore_dir.relative_to(ROOT)
+    if incumbent is not None:
+        print(f"Protection ON -- snapshotted {', '.join(saved) or 'nothing'} to {where}; "
+              f"incumbent test primary = {incumbent:.4f}")
+    else:
+        print(f"Protection ON -- snapshotted {', '.join(saved) or 'nothing'} to {where}; "
+              f"no prior score to compare (any result will be kept)")
+    return incumbent
+
+
+def finalize_submission(summary, incumbent_test_primary: Optional[float],
+                        restore_dir: Path):
+    """Keep this run's submission if it beat the incumbent, otherwise roll the
+    submission-critical files back to the pre-run snapshot. The run's own log
+    archive and run_summary files under runs/ are left in place either way."""
+    new_best_test = (summary or {}).get("best_test_primary")
+    guarding = (PROTECT_BEST_SUBMISSION and incumbent_test_primary is not None
+                and restore_dir.exists())
+
+    if guarding and (new_best_test is None
+                     or new_best_test <= incumbent_test_primary + 1e-9):
+        got = f"{new_best_test:.4f}" if new_best_test is not None else "none"
+        print(f"\nThis run's best test primary ({got}) did NOT beat the incumbent "
+              f"({incumbent_test_primary:.4f}). Restoring submission-critical files "
+              f"from {restore_dir.relative_to(ROOT)}:")
+        for name in _PROTECTED_FILES:
+            src, dst = restore_dir / name, ROOT / name
+            if src.exists():
+                dst.write_bytes(src.read_bytes())
+                print(f"  restored {name}")
+            elif dst.exists():
+                dst.unlink()  # incumbent had none of this file -- drop this run's
+                print(f"  removed {name} (incumbent had none)")
+        print(f"This run's log is still at the runs/ archive; nothing is lost.")
+        return
+
+    try:
+        write_submission_csv()
+    except Exception as e:  # noqa: BLE001 -- a failed submission write must not
+        # discard a completed run; best_pipeline.py and best_test_scores.npy are
+        # already on disk, so this can be retried standalone afterward.
+        print(f"Submission generation failed: {e}")
+        print("The run itself is intact -- retry with:\n"
+              '  python3 -c "from agent_loop import write_submission_csv; write_submission_csv()"')
+
+    if guarding:
+        print(f"\nThis run beat the incumbent ({new_best_test:.4f} > "
+              f"{incumbent_test_primary:.4f}). Submission files updated; previous "
+              f"versions saved at {restore_dir.relative_to(ROOT)}.")
+    elif PROTECT_BEST_SUBMISSION and incumbent_test_primary is None:
+        print("\n(No prior submission to protect -- kept this run's output.)")
+
+
+def preflight():
+    """`python3 agent_loop.py --preflight`: report what a run would overwrite and
+    whether it's safe to run, WITHOUT running anything."""
+    print("Preflight -- a run of agent_loop.py overwrites these files:")
+    for name in _PROTECTED_FILES:
+        p = ROOT / name
+        print(f"  {name:<22} {'present' if p.exists() else 'absent'}")
+
+    sc = _score_submission_test(SUBMISSION_PATH)
+    logged = best_logged_test_primary()
+    print(f"  submission.csv test primary (scored)      : "
+          f"{sc:.4f}" if sc is not None else "  submission.csv test primary (scored)      : n/a")
+    print(f"  run_log.jsonl best test primary (recorded): "
+          f"{logged:.4f}" if logged is not None else "  run_log.jsonl best test primary (recorded): n/a")
+    if sc is not None and logged is not None and abs(sc - logged) > 5e-4:
+        print("  ⚠️ submission.csv and run_log.jsonl disagree -- they may be from different runs")
+
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain", "--", *_PROTECTED_FILES],
+            cwd=str(ROOT), capture_output=True, text=True, timeout=15)
+        dirty = [l for l in out.stdout.splitlines() if l.strip()]
+        if dirty:
+            print("  ⚠️ uncommitted changes in protected files:")
+            for l in dirty:
+                print(f"      {l}")
+            print("  Commit or stash them first so a bad run can be rolled back to a known state.")
+        else:
+            print("  protected files are clean vs git HEAD")
+    except Exception:  # noqa: BLE001
+        print("  (git status check skipped -- not a git repo or git unavailable)")
+
+    mode = "ON" if PROTECT_BEST_SUBMISSION else "OFF"
+    if PROTECT_BEST_SUBMISSION and (sc is not None or logged is not None):
+        ref = logged if logged is not None else sc
+        print(f"\nProtection mode: {mode} -- a run whose best test primary is <= "
+              f"{ref:.4f} will auto-restore submission.csv / best_pipeline.py / run_log.jsonl.")
+    else:
+        print(f"\nProtection mode: {mode}.")
+
+
 def _write_run_summary_files(run_id, run_number, run_started, summary, verdict,
                              wall_sec, llm_iters, iterations_logged, in_tok, out_tok):
     """Write ROOT/run_summary_<run_id>.{txt,json}. Returns [(label, Path), ...]."""
@@ -1256,4 +1400,7 @@ def _write_run_summary_files(run_id, run_number, run_started, summary, verdict,
 
 
 if __name__ == "__main__":
-    main()
+    if "--preflight" in sys.argv:
+        preflight()
+    else:
+        main()
