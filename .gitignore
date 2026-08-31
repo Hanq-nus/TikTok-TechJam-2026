@@ -17,7 +17,7 @@ workdir/test_scores.npy
 # per-iteration LLM scratch, rewritten every iteration
 workdir/candidate_pipeline.py
 
-# runs/ is committed: run_log.jsonl (root) is the latest run; runs/ holds every
-# run's full archive + the accumulating runs/run_summary.md + runs/runs_index.json.
-# Only the rollback scratch is ignored.
+# runs/ is committed: run_log.jsonl (root) is the latest run; run_summary.md and
+# run_summary.json (root) accumulate across runs; runs/ holds every run's full
+# per-iteration archive. Only the rollback scratch is ignored.
 runs/_incumbent_*/

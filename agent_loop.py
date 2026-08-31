@@ -20,9 +20,9 @@ load_dotenv()  # reads .env in the current working directory into os.environ
 ROOT = Path(__file__).parent
 WORKDIR = ROOT / "workdir"
 LOG_PATH = ROOT / "run_log.jsonl"   # the LATEST run only (overwritten each run)
-RUNS_DIR = ROOT / "runs"            # committed archive of every run
-RUNS_INDEX_PATH = RUNS_DIR / "runs_index.json"     # accumulating machine-readable
-RUN_SUMMARY_MD_PATH = RUNS_DIR / "run_summary.md"  # accumulating human-readable
+RUNS_DIR = ROOT / "runs"            # committed per-run archive: runs/run_log_<n>_<ts>.jsonl
+RUN_SUMMARY_MD_PATH = ROOT / "run_summary.md"     # accumulating human-readable, next to submission.csv
+RUN_SUMMARY_JSON_PATH = ROOT / "run_summary.json"  # accumulating machine-readable
 BEST_CODE_PATH = ROOT / "best_pipeline.py"
 BEST_TEST_SCORES_PATH = ROOT / "best_test_scores.npy"
 SUBMISSION_PATH = ROOT / "submission.csv"
@@ -34,6 +34,12 @@ MAX_ITERATIONS = 50
 WALL_CLOCK_LIMIT_SEC = 6 * 60 * 60
 CONVERGENCE_EPS = 0.002
 CONVERGENCE_N = 3
+# Do not allow a run to stop on the convergence rule before this many iterations
+# have been logged (bootstrap + errors included). A run whose first few proposals
+# happen to be timid calibration tweaks near baseline can otherwise satisfy the
+# "3 flat iterations" test at iteration ~6, before the promising directions have
+# been tried at all.
+CONVERGENCE_MIN_ITERS = 20
 PER_ITERATION_TIMEOUT_SEC = 5 * 60  # FM baseline is ~40s; kill slow/hung candidates fast to save budget
 
 # Heuristic threshold, not a hard scientific cutoff. The honest FM baseline's
@@ -584,12 +590,16 @@ Your candidate script MUST:
   without improving is demonstrably not paying off right now, however
   promising it seems in principle or however standard the advice is -- do not
   open your HYPOTHESIS with "since the top-ranked direction is ..." and return
-  to it anyway. Iterations that CRASHED do not count toward this -- a bug is
-  not evidence the idea is wrong, so a direction that only ever errored still
-  deserves a genuine working attempt. If a line in this prompt says
-  "ANTI-REPETITION RULE IS ACTIVE", that condition has already been detected
-  for you and the named DIRECTION is forbidden this iteration. Your DIRECTION
-  line is the on-record evidence of whether you followed this rule.
+  to it anyway. Two EXCEPTIONS: (a) iterations that CRASHED do not count -- a
+  bug is not evidence the idea is wrong, so a direction that only ever errored
+  still deserves a genuine working attempt; (b) if a DIRECTION already produced
+  the current running best, it is exempt -- keep REFINING it (tune its
+  constants, combine it with a prior working change, promote a bucketed feature
+  to a proper field) rather than switching away from what is working. If a line
+  in this prompt says "ANTI-REPETITION RULE IS ACTIVE", that condition has
+  already been detected for you and the named DIRECTION is forbidden this
+  iteration. Your DIRECTION line is the on-record evidence of whether you
+  followed this rule.
 
 Respond in EXACTLY this plain-text format, no JSON, nothing else outside it:
 
@@ -657,7 +667,9 @@ def _anti_repetition_note(history: list[Iteration]) -> str:
     ones are skipped entirely) share a DIRECTION and neither became a new best
     (evaluation starts with 'Improved'), return a line telling the model that
     DIRECTION is off-limits this iteration. A direction that only ever crashed
-    has not had a real attempt, so a bug alone must not rule it out."""
+    has not had a real attempt, so a bug alone must not rule it out. A direction
+    that HOLDS the current running best is also exempt -- the model should keep
+    refining what is working rather than be forced off it."""
     executed = [h for h in history if h.error is None]
     if len(executed) < 2:
         return ""
@@ -667,6 +679,17 @@ def _anti_repetition_note(history: list[Iteration]) -> str:
         return ""
     if any(str(h.evaluation or "").startswith("Improved") for h in (a, b)):
         return ""
+    # Exempt the direction that produced the current running best: refining a
+    # working direction across several iterations is the intended behaviour, not
+    # repetition to break out of.
+    scored = [h for h in history
+              if h.error is None
+              and not str(h.evaluation or "").startswith("REJECTED")
+              and h.metrics.get("valid", {}).get("primary") is not None]
+    if scored:
+        best = max(scored, key=lambda h: h.metrics["valid"]["primary"])
+        if _norm_direction(best.direction) == da:
+            return ""
     return (
         f'\nANTI-REPETITION RULE IS ACTIVE: the last two EXECUTED attempts at '
         f'DIRECTION "{a.direction}" (iterations {a.index} and {b.index}) both ran '
@@ -749,6 +772,9 @@ Propose the next single focused change."""
 # ---- Convergence ----------------------------------------------------------
 
 def has_converged(history: list[Iteration]) -> bool:
+    # Floor: never stop on convergence before the search has had room to explore.
+    if len(history) < CONVERGENCE_MIN_ITERS:
+        return False
     # A candidate rejected for suspected leakage carries an inflated validation
     # primary and must not anchor the convergence test. (`evaluation` is now
     # populated for every iteration with a deterministic verdict, so test for
@@ -1303,7 +1329,7 @@ def finalize_submission(summary, incumbent_test_primary: Optional[float],
             elif dst.exists():
                 dst.unlink()  # incumbent had none of this file -- drop this run's
                 print(f"  removed {name} (incumbent had none)")
-        print("This run's full log is in the runs/ archive and runs/run_summary.md -- nothing lost.")
+        print("This run's full log is in the runs/ archive and run_summary.md -- nothing lost.")
         return "rolled_back"
 
     try:
@@ -1372,9 +1398,9 @@ def preflight():
 def _append_run_summary(run_id, run_number, run_started, summary, verdict,
                         wall_sec, llm_iters, iterations_logged, in_tok, out_tok,
                         outcome, incumbent_test_primary):
-    """Append this run to runs/runs_index.json and regenerate runs/run_summary.md
-    -- ONE accumulating human-readable file, newest run first, with a
-    'Best result so far' line on top. Returns [(label, Path), ...]."""
+    """Append this run to run_summary.json and regenerate run_summary.md (both at
+    ROOT, next to submission.csv) -- ONE accumulating human-readable file, newest
+    run first, with a 'Best result so far' line on top. Returns [(label, Path), ...]."""
     summary = summary or {}
     RUNS_DIR.mkdir(exist_ok=True)
 
@@ -1411,15 +1437,15 @@ def _append_run_summary(run_id, run_number, run_started, summary, verdict,
     }
 
     index = []
-    if RUNS_INDEX_PATH.exists():
+    if RUN_SUMMARY_JSON_PATH.exists():
         try:
-            loaded = json.loads(RUNS_INDEX_PATH.read_text())
+            loaded = json.loads(RUN_SUMMARY_JSON_PATH.read_text())
             index = loaded if isinstance(loaded, list) else []
         except ValueError:
             index = []
     index = [r for r in index if r.get("run_id") != run_id]  # replace on a re-run
     index.append(record)
-    RUNS_INDEX_PATH.write_text(json.dumps(index, indent=2))
+    RUN_SUMMARY_JSON_PATH.write_text(json.dumps(index, indent=2))
 
     kept = [r for r in index
             if str(r.get("submission_outcome", "")).startswith("kept")
@@ -1461,7 +1487,7 @@ def _append_run_summary(run_id, run_number, run_started, summary, verdict,
             "```", "",
         ]
     RUN_SUMMARY_MD_PATH.write_text("\n".join(md))
-    return [("Run summary (md)", RUN_SUMMARY_MD_PATH), ("Runs index (json)", RUNS_INDEX_PATH)]
+    return [("Run summary (md)", RUN_SUMMARY_MD_PATH), ("Run summary (json)", RUN_SUMMARY_JSON_PATH)]
 
 
 if __name__ == "__main__":

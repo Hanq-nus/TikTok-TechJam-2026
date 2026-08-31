@@ -50,12 +50,22 @@ python3 agent_loop.py
 
 Bootstraps iteration 0 (the verified official FM baseline), then iterates
 until convergence (validation primary hasn't improved by more than
-ε = 0.002 over 3 consecutive iterations), the 50-iteration cap, or the 6-hour
-wall-clock limit — matching the organizers' own convergence rule exactly. On
-completion it writes `submission.csv`, a readable run summary, and archives
-the full log under `runs/`. A submission-protection check compares the run's
-result against the last known-good one and won't overwrite a better
-committed result with a worse one.
+ε = 0.002 over 3 consecutive iterations, and never before iteration 20), the
+50-iteration cap, or the 6-hour wall-clock limit. A submission-protection
+check compares the run's result against the last known-good one and won't
+overwrite a better committed result with a worse one.
+
+### Run artifacts
+
+| File | What it is |
+| --- | --- |
+| `run_log.jsonl` | The **latest run**, one JSON object per iteration: the hypothesis and its DIRECTION label, the unified code diff applied, valid + test GAUC / nDCG@5 / primary, any error traceback, and a deterministic one-line verdict (`Improved … / No improvement … / Failed: … / REJECTED: …`). |
+| `run_summary.md` | **Accumulating, human-readable**, newest run first. A "Best result so far" line on top, then one section per run: resources used (iterations vs. the 49 cap, wall-clock, input/output tokens), the number of manual-intervention signals detected, the rollback outcome, and the run's full per-iteration table. |
+| `run_summary.json` | The same, machine-readable — one record per run with the resource totals, intervention verdict, `submission_outcome`, and the per-iteration array. |
+| `runs/run_log_<n>_<timestamp>.jsonl` | A permanent copy of every run's `run_log.jsonl` (with code diffs), so no run's iteration log is ever lost. |
+
+On completion the agent writes `submission.csv`, updates `run_summary.md` /
+`run_summary.json`, and archives the run under `runs/`.
 
 ## Reproducing the result
 
