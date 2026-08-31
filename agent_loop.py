@@ -1,4 +1,5 @@
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,14 @@ PER_ITERATION_TIMEOUT_SEC = 5 * 60  # FM baseline is ~40s; kill slow/hung candid
 # Raise or lower it if the guard fires too often or never.
 LEAKAGE_GAP_THRESHOLD = 0.02
 
+# The valid-test GAP guard above only catches ASYMMETRIC leaks (valid inflated,
+# test not). A feature built from same-split labels for BOTH valid and test
+# inflates both equally and slips past it. Backstop: no legitimate single change
+# in this task has ever moved validation primary more than ~0.0025 at once, so a
+# one-iteration jump bigger than this is auto-rejected for manual review. Tune up
+# if a genuine large gain is ever wrongly rejected.
+LARGE_JUMP_THRESHOLD = 0.015
+
 # Fill in MODEL once you've checked GET /v1/models for what's available.
 MODEL = "qwen3-coder-next"
 API_BASE_URL = os.environ.get("SOCLAAS_BASE_URL")
@@ -60,6 +69,16 @@ _RUN_META: dict = {}
 # in the same call still counts. `calls_without_usage` > 0 means the endpoint
 # omitted usage on some calls and the totals are a lower bound.
 _TOKEN_TOTALS: dict = {"prompt": 0, "completion": 0, "calls": 0, "calls_without_usage": 0}
+
+# Best-effort manual-intervention detection (see _intervention_verdict()). Reset
+# by main(). best_pipeline_hash is refreshed after every write the loop itself
+# performs; file_integrity_violations collects any on-disk change the loop did
+# NOT make; source_hash_at_start pins agent_loop.py's own source at run start.
+_INTEGRITY: dict = {
+    "best_pipeline_hash": None,
+    "file_integrity_violations": [],
+    "source_hash_at_start": None,
+}
 
 
 @dataclass
@@ -274,6 +293,113 @@ def capture_best_test_scores(iter_index: int):
     BEST_TEST_SCORES_PATH.write_bytes(scores_path.read_bytes())
 
 
+# ---- Leakage & integrity checks ----------------------------------------------
+
+# A loop over splits[<'train'|'valid'|'test'|variable>], capturing which index.
+_SPLIT_ITER_RE = re.compile(
+    r"for\s+[\w ,]+\s+in\s+(?:enumerate\s*\(\s*)?splits\s*\[\s*"
+    r"(?:['\"](?P<lit>train|valid|test)['\"]|(?P<var>\w+))\s*\]"
+)
+# A per-row label read from a raw KuaiRand tuple: index 6 is `long_view`, [-1] too.
+_LABEL_READ_RE = re.compile(r"\[\s*6\s*\]|\[\s*-\s*1\s*\]")
+
+
+def scan_candidate_for_leakage(code: str):
+    """Best-effort STATIC scan for the leak class the valid-test gap guard can't
+    catch: a per-row feature built from valid/test *labels* (raw-tuple index 6 =
+    long_view, or [-1]), computed per-split so BOTH valid and test inflate
+    equally. Flags a loop over splits[valid|test] (or a variable split name --
+    the leaky pattern parameterises it) that reads a label index within ~15
+    lines. Returns a reason string, or None if clean. Heuristic: a legitimate
+    candidate can trip it; widen the window / tighten the regex if so."""
+    lines = code.splitlines()
+    for m in _SPLIT_ITER_RE.finditer(code):
+        if m.group("lit") == "train":
+            continue  # aggregating over train only is the CORRECT pattern
+        ln = code[:m.start()].count("\n")
+        window = "\n".join(lines[ln:ln + 15])
+        lab = _LABEL_READ_RE.search(window)
+        if lab:
+            which = m.group("lit") or f"variable '{m.group('var')}'"
+            return (f"line ~{ln + 1}: loop over splits[{which}] reads a per-row label "
+                    f"({lab.group(0)!r}) within ~15 lines -- a feature built from "
+                    f"valid/test labels leaks symmetrically across both splits and "
+                    f"evades the valid-test primary gap guard")
+    return None
+
+
+def _sha256_file(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _record_best_pipeline_hash():
+    """Call immediately after the loop itself writes best_pipeline.py."""
+    _INTEGRITY["best_pipeline_hash"] = _sha256_file(BEST_CODE_PATH)
+
+
+def _verify_best_pipeline_hash(iteration_index):
+    """Call immediately before load_current_pipeline_code(). Any mismatch means
+    something other than this loop edited best_pipeline.py on disk."""
+    expected = _INTEGRITY["best_pipeline_hash"]
+    if expected is None:
+        return
+    actual = _sha256_file(BEST_CODE_PATH)
+    if actual != expected:
+        _INTEGRITY["file_integrity_violations"].append({
+            "iteration": iteration_index,
+            "detail": (f"best_pipeline.py content hash changed outside the loop "
+                       f"(expected {expected[:12]}..., found "
+                       f"{actual[:12] + '...' if actual else 'unreadable'})"),
+        })
+        _INTEGRITY["best_pipeline_hash"] = actual  # re-baseline so each edit flags once
+
+
+def _intervention_verdict(wall_sec: float, history, prof_sec: float) -> dict:
+    """Combine the three checkable intervention signals into a verdict. Not proof
+    of anything -- vectors outside this process are invisible from here."""
+    accounted = prof_sec + sum(h.duration_sec for h in history)
+    gap = wall_sec - accounted
+    gap_exceeds = gap > 30.0 and gap > 0.05 * wall_sec
+
+    src_end = _sha256_file(__file__)
+    src_start = _INTEGRITY["source_hash_at_start"]
+    source_modified = bool(src_start and src_end and src_end != src_start)
+
+    violations = list(_INTEGRITY["file_integrity_violations"])
+    if not violations and not source_modified and not gap_exceeds:
+        summary = (
+            "No evidence of manual intervention detected (best_pipeline.py integrity "
+            "intact, script source unmodified, no unexplained wall-clock gap). This is "
+            "evidence of an unattended run, not proof -- intervention vectors outside "
+            "this process (e.g. editing unrelated files, OS-level pause/resume) are not "
+            "detectable from here."
+        )
+    else:
+        parts = []
+        if violations:
+            parts.append(
+                f"{len(violations)} best_pipeline.py integrity violation(s) [" +
+                "; ".join(f"iter {v['iteration']}: {v['detail']}" for v in violations) + "]")
+        if source_modified:
+            parts.append("agent_loop.py's own source file changed on disk during the run")
+        if gap_exceeds:
+            parts.append(
+                f"unexplained wall-clock gap of {gap:.0f}s "
+                f"({gap / wall_sec * 100:.1f}% of {wall_sec:.0f}s total) -- soft heuristic, not proof")
+        summary = "POSSIBLE MANUAL INTERVENTION DETECTED: " + "; ".join(parts)
+
+    return {
+        "intervention_signals_detected": violations,
+        "own_source_modified_during_run": source_modified,
+        "unaccounted_wall_clock_gap_seconds": round(gap, 1),
+        "unaccounted_wall_clock_gap_exceeds_threshold": gap_exceeds,
+        "summary": summary,
+    }
+
+
 # ---- LLM proposal step ----------------------------------------------------
 
 SYSTEM_PROMPT = """You are an autonomous ML research agent competing on the \
@@ -413,11 +539,27 @@ Your candidate script MUST:
     * a running / time-decayed / expanding per-user statistic whose
       accumulator keeps updating as you iterate over valid or test rows.
   A candidate whose validation primary is far above its test primary is
-  almost always leaking. The loop now AUTO-REJECTS any candidate whose
+  almost always leaking. The loop AUTO-REJECTS any candidate whose
   (valid primary - test primary) gap exceeds ~0.02 -- the honest baseline
-  gap is ~0.006 -- keeping the previous best instead. A leaky candidate
-  therefore cannot win; it only wastes an iteration. Build the feature
-  correctly (train-only) the first time.
+  gap is ~0.006 -- keeping the previous best instead.
+  ⚠️ SYMMETRIC LEAKAGE -- the trap the gap check CANNOT see. If you build a
+  per-row feature from the LABELS of other rows in the SAME split -- e.g.
+  "this user's mean long_view over their previous VALID impressions" for
+  valid rows, and over their previous TEST impressions for test rows -- then
+  BOTH valid and test primary inflate by the same amount, the gap stays
+  normal, and the check above passes a result that is still cheating. The
+  hidden-test re-score would just be measuring the peek. This is explicitly
+  forbidden: a history / rate / count / sequence feature for a valid or test
+  row MUST be computed from that user's TRAIN rows only (a frozen per-user
+  train statistic, looked up by user_id), NEVER from other valid/test rows.
+  Two extra guards enforce this: (a) candidates are STATICALLY SCANNED for a
+  loop over splits['valid'/'test'] (or a variable split name) that reads a
+  per-row label (raw-tuple index 6 = long_view, or [-1]) -- a match is
+  auto-rejected before it even runs; (b) any single iteration that gains
+  more than ~0.015 validation primary over the current best is auto-rejected
+  for manual review, because no legitimate change in this task has ever
+  moved the score that much in one step. Build the feature train-only the
+  first time.
 - AVOID LOCAL-OPTIMUM COLLAPSE. If the recent iteration history below shows
   several consecutive attempts clustering within ~0.002 of each other and
   only tuning a numeric knob (temperature, clipping threshold, smoothing
@@ -671,9 +813,14 @@ def append_log(iteration: Iteration):
 # ---- Main loop --------------------------------------------------------------
 
 def main():
+    # Pin our own source hash at the very start (Part 2 check #2).
+    _INTEGRITY.update(best_pipeline_hash=None, file_integrity_violations=[],
+                      source_hash_at_start=_sha256_file(__file__))
+
     WORKDIR.mkdir(exist_ok=True)
     RUNS_DIR.mkdir(exist_ok=True)
     bootstrap_pipeline()
+    _record_best_pipeline_hash()  # the loop just wrote best_pipeline.py
 
     # Identify this run. run_log.jsonl holds just this run (so print_run_summary
     # etc. keep working unchanged); a timestamped copy is also kept under runs/
@@ -695,12 +842,15 @@ def main():
     start_time = time.time()
 
     print("Profiling dataset (one-time, grounds the LLM in real facts)...")
+    _t_prof = time.time()
     data_profile = profile_dataset()
+    prof_sec = time.time() - _t_prof
     print(data_profile)
 
     # Score iteration 0 (the deterministic baseline) first, before any LLM call.
     print("Scoring bootstrap baseline (iteration 0)...")
     t0 = time.time()
+    _verify_best_pipeline_hash(0)
     baseline_res = run_pipeline(load_current_pipeline_code())
     best_valid_primary = baseline_res["valid"]["primary"]
     iteration0 = Iteration(
@@ -722,6 +872,7 @@ def main():
             print(f"Wall-clock limit hit at iteration {i}. Stopping.")
             break
 
+        _verify_best_pipeline_hash(i)
         current_code = load_current_pipeline_code()
 
         t0 = time.time()
@@ -754,6 +905,19 @@ def main():
             completion_tokens=proposal["completion_tokens"],
         )
         prev_best = best_valid_primary
+
+        # Static leakage scan -- reject BEFORE running (saves the compute) if the
+        # candidate reads valid/test labels to build a feature (the symmetric
+        # leak the valid-test gap guard can't catch).
+        leak_reason = scan_candidate_for_leakage(candidate_code)
+        if leak_reason is not None:
+            iteration.evaluation = f"REJECTED: static leakage scan -- {leak_reason}"
+            iteration.duration_sec = time.time() - t0
+            print(f"[iter {i}] REJECTED (static leakage scan): {leak_reason} -- {hypothesis}")
+            history.append(iteration)
+            append_log(iteration)
+            continue
+
         try:
             res = run_pipeline(candidate_code)
             iteration.metrics = res
@@ -775,9 +939,23 @@ def main():
                 print(f"[iter {i}] REJECTED (suspected leakage): valid.primary={vp:.4f} "
                       f"test.primary={tp_str} gap={gap:.4f} > {LEAKAGE_GAP_THRESHOLD}; "
                       f"best stays {best_valid_primary:.4f} -- {hypothesis}")
+            elif (vp - prev_best) > LARGE_JUMP_THRESHOLD:
+                # Backstop for a symmetric leak the gap check misses: an
+                # implausibly large one-step gain. Not accepted -- flagged for
+                # manual review. Tune LARGE_JUMP_THRESHOLD if a genuine big gain
+                # is ever wrongly caught here.
+                iteration.evaluation = (
+                    f"REJECTED: implausibly large single-iteration gain "
+                    f"(+{vp - prev_best:.4f} vs best {prev_best:.4f}, threshold "
+                    f"{LARGE_JUMP_THRESHOLD}) -- likely undetected leakage, needs manual review"
+                )
+                print(f"[iter {i}] REJECTED (implausible +{vp - prev_best:.4f} jump): "
+                      f"valid.primary={vp:.4f} test.primary={tp_str}; best stays "
+                      f"{best_valid_primary:.4f} -- {hypothesis}")
             elif vp > best_valid_primary:
                 best_valid_primary = vp
                 BEST_CODE_PATH.write_text(candidate_code)
+                _record_best_pipeline_hash()  # the loop just wrote best_pipeline.py
                 capture_best_test_scores(i)
                 print(f"[iter {i}] NEW BEST valid.primary={vp:.4f} test.primary={tp_str} -- {hypothesis}")
             else:
@@ -803,6 +981,7 @@ def main():
     wall_sec = time.time() - start_time
     llm_iters = len([h for h in history if h.index >= 1])  # excludes bootstrap iteration 0
     in_tok, out_tok = _TOKEN_TOTALS["prompt"], _TOKEN_TOTALS["completion"]
+    verdict = _intervention_verdict(wall_sec, history, prof_sec)
 
     print(f"\nDone. Best valid.primary: {best_valid_primary:.4f}")
     print(f"Best pipeline saved at: {BEST_CODE_PATH}")
@@ -819,8 +998,18 @@ def main():
     if _TOKEN_TOTALS["calls_without_usage"]:
         print(f"  [!] {_TOKEN_TOTALS['calls_without_usage']} of {_TOKEN_TOTALS['calls']} "
               f"LLM calls returned no usage field -- token totals are a LOWER BOUND")
+    print(f"  Manual-intervention check: {verdict['summary']}")
     print()
-    print_run_summary()
+    summary = print_run_summary()
+    print()
+    try:
+        for label, p in _write_run_summary_files(
+                run_id, run_number, run_started, summary, verdict,
+                wall_sec, llm_iters, len(history), in_tok, out_tok):
+            print(f"{label}: {p}")
+    except Exception as e:  # noqa: BLE001 -- a summary-file failure must not
+        # discard an otherwise-complete run.
+        print(f"Run-summary files not written (run is otherwise complete): {e}")
     print()
     try:
         write_submission_csv()
@@ -908,14 +1097,20 @@ def best_logged_test_primary():
 
 
 def print_run_summary(logfile: Optional[Path] = None):
-    """Pretty-print a run log as a readable table. Defaults to run_log.jsonl (the
-    latest run); pass a path from runs/ to re-view any past run, e.g.
+    """Pretty-print a run log as a readable table AND return its computed data.
+    Defaults to run_log.jsonl (the latest run); pass a path from runs/ to
+    re-view any past run, e.g.
     python3 -c "from agent_loop import print_run_summary; print_run_summary('runs/run_log_003_20260831T0145.jsonl')"
-    """
+
+    Returns None if the log file is missing, otherwise a dict:
+      {"text", "iterations", "best_index", "best_valid_primary",
+       "best_test_primary", "baseline_valid_primary", "n_ok", "n_errored",
+       "n_rejected"}
+    Terminal output is byte-for-byte identical to printing alone."""
     path = Path(logfile) if logfile is not None else LOG_PATH
     if not path.exists():
         print(f"No log found at {path}")
-        return
+        return None
 
     iters = []
     with path.open() as f:
@@ -924,9 +1119,15 @@ def print_run_summary(logfile: Optional[Path] = None):
             if line:
                 iters.append(json.loads(line))
 
+    lines: list = []
+
+    def _emit(s=""):
+        print(s)
+        lines.append(s)
+
     meta = next((it for it in iters if it.get("run_id")), None)
     if meta:
-        print(f"Run {meta.get('run_number')} (id {meta.get('run_id')}, "
+        _emit(f"Run {meta.get('run_number')} (id {meta.get('run_id')}, "
               f"started {meta.get('run_started')})")
 
     def fmt_primary(entry, split):
@@ -934,11 +1135,12 @@ def print_run_summary(logfile: Optional[Path] = None):
         return f"{v:.4f}" if v is not None else "  --  "
 
     baseline_valid = None
-    best_idx, best_valid = None, -1.0
+    best_idx, best_valid, best_test = None, -1.0, None
+    table_rows: list = []
 
-    print(f"{'#':>3} {'status':<7} {'valid':>8} {'test':>8} {'Δvalid':>8} {'time':>7} "
+    _emit(f"{'#':>3} {'status':<7} {'valid':>8} {'test':>8} {'Δvalid':>8} {'time':>7} "
           f"{'direction':<14} hypothesis")
-    print("-" * 108)
+    _emit("-" * 108)
 
     for it in iters:
         idx = it["index"]
@@ -947,6 +1149,7 @@ def print_run_summary(logfile: Optional[Path] = None):
         rejected = bool(evaluation) and evaluation.startswith("REJECTED")
         status = "ERROR" if err else ("REJECT" if rejected else "OK")
         valid_p = (it.get("metrics") or {}).get("valid", {}).get("primary")
+        test_p = (it.get("metrics") or {}).get("test", {}).get("primary")
         dur = it.get("duration_sec", 0)
         direction = (it.get("direction") or "-")[:14]
 
@@ -954,11 +1157,11 @@ def print_run_summary(logfile: Optional[Path] = None):
             baseline_valid = valid_p
         # A rejected (suspected-leakage) iteration must never count as "best".
         if valid_p is not None and not rejected and valid_p > best_valid:
-            best_valid, best_idx = valid_p, idx
+            best_valid, best_idx, best_test = valid_p, idx, test_p
 
-        delta = ""
-        if valid_p is not None and baseline_valid is not None:
-            delta = f"{valid_p - baseline_valid:+.4f}"
+        delta_valid = (valid_p - baseline_valid) if (
+            valid_p is not None and baseline_valid is not None) else None
+        delta = f"{delta_valid:+.4f}" if delta_valid is not None else ""
 
         hyp = it.get("hypothesis", "")
         hyp_short = (hyp[:72] + "...") if len(hyp) > 75 else hyp
@@ -973,20 +1176,83 @@ def print_run_summary(logfile: Optional[Path] = None):
         if cont:
             hyp_short = f"{hyp_short}\n{'':>49}⤷ {cont}"
 
-        print(f"{idx:>3} {status:<7} {fmt_primary(it,'valid'):>8} {fmt_primary(it,'test'):>8} "
+        _emit(f"{idx:>3} {status:<7} {fmt_primary(it,'valid'):>8} {fmt_primary(it,'test'):>8} "
               f"{delta:>8} {dur:>6.1f}s {direction:<14} {hyp_short}")
 
-    print("-" * 108)
+        table_rows.append({
+            "index": idx,
+            "status": status,
+            "valid_primary": valid_p,
+            "test_primary": test_p,
+            "delta_valid": delta_valid,
+            "direction": it.get("direction"),
+            "duration_sec": dur,
+            "hypothesis": it.get("hypothesis", ""),
+            "source": it.get("source"),
+        })
+
+    _emit("-" * 108)
     n_rej = sum(1 for it in iters
                 if str(it.get("evaluation") or "").startswith("REJECTED"))
     n_ok = sum(1 for it in iters if not it.get("error")
                and not str(it.get("evaluation") or "").startswith("REJECTED"))
     tail = f", {n_rej} rejected (suspected leakage)" if n_rej else ""
-    print(f"{len(iters)} iterations: {n_ok} succeeded, "
+    _emit(f"{len(iters)} iterations: {n_ok} succeeded, "
           f"{len(iters) - n_ok - n_rej} errored{tail}.")
     if best_idx is not None:
-        print(f"Best so far: iteration {best_idx} (valid primary {best_valid:.4f}, "
+        _emit(f"Best so far: iteration {best_idx} (valid primary {best_valid:.4f}, "
               f"baseline was {baseline_valid:.4f})")
+
+    return {
+        "text": "\n".join(lines),
+        "iterations": table_rows,
+        "best_index": best_idx,
+        "best_valid_primary": best_valid if best_idx is not None else None,
+        "best_test_primary": best_test if best_idx is not None else None,
+        "baseline_valid_primary": baseline_valid,
+        "n_ok": n_ok,
+        "n_errored": len(iters) - n_ok - n_rej,
+        "n_rejected": n_rej,
+    }
+
+
+def _write_run_summary_files(run_id, run_number, run_started, summary, verdict,
+                             wall_sec, llm_iters, iterations_logged, in_tok, out_tok):
+    """Write ROOT/run_summary_<run_id>.{txt,json}. Returns [(label, Path), ...]."""
+    summary = summary or {}
+    txt_path = ROOT / f"run_summary_{run_id}.txt"
+    json_path = ROOT / f"run_summary_{run_id}.json"
+
+    txt_path.write_text((summary.get("text") or "(no run summary text)") + "\n")
+
+    payload = {
+        "run_number": run_number,
+        "run_id": run_id,
+        "run_started": run_started,
+        "best_iteration_index": summary.get("best_index"),
+        "best_valid_primary": summary.get("best_valid_primary"),
+        "best_test_primary": summary.get("best_test_primary"),
+        "baseline_valid_primary": summary.get("baseline_valid_primary"),
+        "iterations_used": llm_iters,
+        "iterations_logged": iterations_logged,
+        "iterations_cap": MAX_ITERATIONS - 1,
+        "tokens": {
+            "prompt": in_tok,
+            "completion": out_tok,
+            "total": in_tok + out_tok,
+            "calls": _TOKEN_TOTALS["calls"],
+            "calls_without_usage": _TOKEN_TOTALS["calls_without_usage"],
+        },
+        "wall_clock_seconds": round(wall_sec, 1),
+        "own_source_modified_during_run": verdict["own_source_modified_during_run"],
+        "intervention_signals_detected": verdict["intervention_signals_detected"],
+        "unaccounted_wall_clock_gap_seconds": verdict["unaccounted_wall_clock_gap_seconds"],
+        "unaccounted_wall_clock_gap_exceeds_threshold": verdict["unaccounted_wall_clock_gap_exceeds_threshold"],
+        "manual_intervention_summary": verdict["summary"],
+        "iterations": summary.get("iterations", []),
+    }
+    json_path.write_text(json.dumps(payload, indent=2))
+    return [("Run summary (text)", txt_path), ("Run summary (json)", json_path)]
 
 
 if __name__ == "__main__":
