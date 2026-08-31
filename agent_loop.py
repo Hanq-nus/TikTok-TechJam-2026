@@ -18,7 +18,8 @@ load_dotenv()  # reads .env in the current working directory into os.environ
 
 ROOT = Path(__file__).parent
 WORKDIR = ROOT / "workdir"
-LOG_PATH = ROOT / "run_log.jsonl"
+LOG_PATH = ROOT / "run_log.jsonl"   # the CURRENT run only (overwritten each run)
+RUNS_DIR = ROOT / "runs"            # permanent archive: runs/run_log_<n>_<timestamp>.jsonl
 BEST_CODE_PATH = ROOT / "best_pipeline.py"
 BEST_TEST_SCORES_PATH = ROOT / "best_test_scores.npy"
 SUBMISSION_PATH = ROOT / "submission.csv"
@@ -49,6 +50,17 @@ client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
 RESULT_MARKER = "RESULT_JSON:"
 
+# Filled in by main() at the start of each run. Every run_log line carries these
+# so a timestamped archive file under runs/ is self-identifying.
+_RUN_META: dict = {}
+
+# Running LLM token totals for the whole run (deliverable: Results Summary needs
+# total input+output tokens). Reset by main(); accumulated in
+# propose_next_iteration() right after each API call, so a later parse failure
+# in the same call still counts. `calls_without_usage` > 0 means the endpoint
+# omitted usage on some calls and the totals are a lower bound.
+_TOKEN_TOTALS: dict = {"prompt": 0, "completion": 0, "calls": 0, "calls_without_usage": 0}
+
 
 @dataclass
 class Iteration:
@@ -72,6 +84,10 @@ class Iteration:
     next_notes: Optional[str] = None
     # unified_diff(best_pipeline.py -> this candidate), joined into one string.
     code_diff: Optional[str] = None
+    # LLM token usage for this iteration's proposal call (None if the endpoint
+    # omitted usage, or if the call failed before usage was captured).
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
     duration_sec: float = 0.0
 
 
@@ -413,16 +429,18 @@ Your candidate script MUST:
   the model can represent rather than how its existing output is scaled.
 - ANTI-REPETITION ACROSS DIRECTIONS (hard rule). Each history line below is
   tagged with the DIRECTION that iteration pursued. If the TWO most recent
-  iterations share the same DIRECTION and NEITHER of them improved on the
-  running best validation primary, you MUST choose a DIFFERENT DIRECTION this
-  iteration. A direction whose last two consecutive attempts both failed to
-  improve is demonstrably not working right now, however promising it seems
-  in principle or however standard the advice is -- do not open your
-  HYPOTHESIS with "since the top-ranked direction is ..." and return to it
-  anyway. If a line in this prompt says "ANTI-REPETITION RULE IS ACTIVE",
-  that condition has already been detected for you and the named DIRECTION is
-  forbidden this iteration. Your DIRECTION line is the on-record evidence of
-  whether you followed this rule.
+  iterations THAT RAN WITHOUT ERROR share the same DIRECTION and NEITHER
+  improved on the running best validation primary, you MUST choose a DIFFERENT
+  DIRECTION this iteration. A direction that produced two clean, working runs
+  without improving is demonstrably not paying off right now, however
+  promising it seems in principle or however standard the advice is -- do not
+  open your HYPOTHESIS with "since the top-ranked direction is ..." and return
+  to it anyway. Iterations that CRASHED do not count toward this -- a bug is
+  not evidence the idea is wrong, so a direction that only ever errored still
+  deserves a genuine working attempt. If a line in this prompt says
+  "ANTI-REPETITION RULE IS ACTIVE", that condition has already been detected
+  for you and the named DIRECTION is forbidden this iteration. Your DIRECTION
+  line is the on-record evidence of whether you followed this rule.
 
 Respond in EXACTLY this plain-text format, no JSON, nothing else outside it:
 
@@ -486,23 +504,26 @@ def _norm_direction(s: Optional[str]) -> str:
 
 
 def _anti_repetition_note(history: list[Iteration]) -> str:
-    """If the two most recent iterations share a DIRECTION and neither became a
-    new best (evaluation starts with 'Improved'), return a line telling the
-    model that DIRECTION is off-limits this iteration. Empty string otherwise."""
-    if len(history) < 2:
+    """If the two most recently EXECUTED iterations (error is None -- errored
+    ones are skipped entirely) share a DIRECTION and neither became a new best
+    (evaluation starts with 'Improved'), return a line telling the model that
+    DIRECTION is off-limits this iteration. A direction that only ever crashed
+    has not had a real attempt, so a bug alone must not rule it out."""
+    executed = [h for h in history if h.error is None]
+    if len(executed) < 2:
         return ""
-    a, b = history[-2], history[-1]
+    a, b = executed[-2], executed[-1]
     da, db = _norm_direction(a.direction), _norm_direction(b.direction)
     if not da or da != db:
         return ""
-    improved = any(str(h.evaluation or "").startswith("Improved") for h in (a, b))
-    if improved:
+    if any(str(h.evaluation or "").startswith("Improved") for h in (a, b)):
         return ""
     return (
-        f'\nANTI-REPETITION RULE IS ACTIVE: iterations {a.index} and {b.index} both used '
-        f'DIRECTION "{a.direction}" and neither improved on the best validation primary. '
-        f'You MUST pick a DIRECTION whose normalised label differs from "{a.direction}" '
-        f'this iteration.\n'
+        f'\nANTI-REPETITION RULE IS ACTIVE: the last two EXECUTED attempts at '
+        f'DIRECTION "{a.direction}" (iterations {a.index} and {b.index}) both ran '
+        f'without improving on the best validation primary. You MUST pick a '
+        f'DIRECTION whose normalised label differs from "{a.direction}" this '
+        f'iteration.\n'
     )
 
 
@@ -530,6 +551,19 @@ Propose the next single focused change."""
             {"role": "user", "content": user_msg},
         ],
     )
+
+    # Capture token usage FIRST -- before parsing, which may raise -- so a
+    # malformed response still counts toward the run total. Some OpenAI-compatible
+    # endpoints omit `usage`; treat that as "unknown", not an error.
+    usage = getattr(resp, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+    completion_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+    _TOKEN_TOTALS["calls"] += 1
+    if prompt_tokens is None and completion_tokens is None:
+        _TOKEN_TOTALS["calls_without_usage"] += 1
+    _TOKEN_TOTALS["prompt"] += prompt_tokens or 0
+    _TOKEN_TOTALS["completion"] += completion_tokens or 0
+
     text = resp.choices[0].message.content.strip()
 
     def _field(label: str, others: list) -> Optional[str]:
@@ -557,6 +591,8 @@ Propose the next single focused change."""
         "direction": direction,
         "source": source or "(not provided)",
         "next_notes": next_notes or "(not provided)",
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
     }
     return proposal, code_match.group(1)
 
@@ -603,28 +639,58 @@ def summarize_evaluation(iteration: Iteration, best_before: float) -> str:
 
 
 def append_log(iteration: Iteration):
-    """Single writer for run_log.jsonl so every entry carries the same schema."""
+    """Single writer for the run log. Each line is appended to BOTH run_log.jsonl
+    (the current run only, overwritten every run so the summary tooling keeps
+    working unchanged) and the permanent per-run archive under runs/. Every line
+    is stamped with the run identifier so an archived file stands alone."""
+    line = json.dumps({
+        "run_number": _RUN_META.get("run_number"),
+        "run_id": _RUN_META.get("run_id"),
+        "run_started": _RUN_META.get("run_started"),
+        "index": iteration.index,
+        "hypothesis": iteration.hypothesis,
+        "direction": iteration.direction,
+        "source": iteration.source,
+        "metrics": iteration.metrics,
+        "error": iteration.error,
+        "evaluation": iteration.evaluation,
+        "code_diff": iteration.code_diff,
+        "next_notes": iteration.next_notes,
+        "prompt_tokens": iteration.prompt_tokens,
+        "completion_tokens": iteration.completion_tokens,
+        "duration_sec": iteration.duration_sec,
+    }) + "\n"
     with LOG_PATH.open("a") as f:
-        f.write(json.dumps({
-            "index": iteration.index,
-            "hypothesis": iteration.hypothesis,
-            "direction": iteration.direction,
-            "source": iteration.source,
-            "metrics": iteration.metrics,
-            "error": iteration.error,
-            "evaluation": iteration.evaluation,
-            "code_diff": iteration.code_diff,
-            "next_notes": iteration.next_notes,
-            "duration_sec": iteration.duration_sec,
-        }) + "\n")
+        f.write(line)
+    archive = _RUN_META.get("archive_path")
+    if archive is not None:
+        with archive.open("a") as f:
+            f.write(line)
 
 
 # ---- Main loop --------------------------------------------------------------
 
 def main():
     WORKDIR.mkdir(exist_ok=True)
+    RUNS_DIR.mkdir(exist_ok=True)
     bootstrap_pipeline()
-    LOG_PATH.write_text("")  # fresh run log every time the script is run
+
+    # Identify this run. run_log.jsonl holds just this run (so print_run_summary
+    # etc. keep working unchanged); a timestamped copy is also kept under runs/
+    # so no past run is ever lost. run_number is "files already in runs/ + 1" --
+    # best-effort ordering, the timestamp in the name is the real identifier.
+    run_started = time.strftime("%Y-%m-%dT%H:%M:%S")
+    run_id = time.strftime("%Y%m%dT%H%M%S")
+    run_number = 1 + len(list(RUNS_DIR.glob("run_log_*.jsonl")))
+    archive_path = RUNS_DIR / f"run_log_{run_number:03d}_{run_id}.jsonl"
+    _RUN_META.clear()
+    _RUN_META.update(run_number=run_number, run_id=run_id,
+                     run_started=run_started, archive_path=archive_path)
+    _TOKEN_TOTALS.update(prompt=0, completion=0, calls=0, calls_without_usage=0)
+    LOG_PATH.write_text("")
+    archive_path.write_text("")
+    print(f"Run {run_number} (id {run_id}) -- archiving to {archive_path.relative_to(ROOT)}")
+
     history: list[Iteration] = []
     start_time = time.time()
 
@@ -684,6 +750,8 @@ def main():
             index=i, hypothesis=hypothesis, code_path=WORKDIR / "candidate_pipeline.py",
             direction=proposal["direction"], source=proposal["source"],
             next_notes=proposal["next_notes"], code_diff=code_diff,
+            prompt_tokens=proposal["prompt_tokens"],
+            completion_tokens=proposal["completion_tokens"],
         )
         prev_best = best_valid_primary
         try:
@@ -732,9 +800,25 @@ def main():
             print(f"Converged after {i + 1} iterations (incl. bootstrap).")
             break
 
+    wall_sec = time.time() - start_time
+    llm_iters = len([h for h in history if h.index >= 1])  # excludes bootstrap iteration 0
+    in_tok, out_tok = _TOKEN_TOTALS["prompt"], _TOKEN_TOTALS["completion"]
+
     print(f"\nDone. Best valid.primary: {best_valid_primary:.4f}")
     print(f"Best pipeline saved at: {BEST_CODE_PATH}")
-    print(f"Full run log at: {LOG_PATH}")
+    print(f"Current run log at: {LOG_PATH}")
+    print(f"This run archived at: {archive_path}  (run {run_number}, id {run_id})")
+    print()
+    print("=== Results Summary (resource usage -- for the deliverable) ===")
+    print(f"  Best valid.primary  : {best_valid_primary:.4f}")
+    print(f"  Wall-clock          : {wall_sec:.0f}s  ({wall_sec / 60:.1f} min)")
+    print(f"  Iterations used     : {llm_iters} LLM iterations "
+          f"(cap {MAX_ITERATIONS - 1}); {len(history)} logged incl. bootstrap")
+    print(f"  Token consumption   : {in_tok + out_tok:,} total  "
+          f"({in_tok:,} input + {out_tok:,} output)  over {_TOKEN_TOTALS['calls']} LLM calls")
+    if _TOKEN_TOTALS["calls_without_usage"]:
+        print(f"  [!] {_TOKEN_TOTALS['calls_without_usage']} of {_TOKEN_TOTALS['calls']} "
+              f"LLM calls returned no usage field -- token totals are a LOWER BOUND")
     print()
     print_run_summary()
     print()
@@ -823,20 +907,27 @@ def best_logged_test_primary():
     return best_test
 
 
-def print_run_summary():
-    """Pretty-print run_log.jsonl as a readable table. Can also be called
-    standalone (python3 -c "from agent_loop import print_run_summary; print_run_summary()")
-    to re-view a completed run's log without rerunning the agent."""
-    if not LOG_PATH.exists():
-        print(f"No log found at {LOG_PATH}")
+def print_run_summary(logfile: Optional[Path] = None):
+    """Pretty-print a run log as a readable table. Defaults to run_log.jsonl (the
+    latest run); pass a path from runs/ to re-view any past run, e.g.
+    python3 -c "from agent_loop import print_run_summary; print_run_summary('runs/run_log_003_20260831T0145.jsonl')"
+    """
+    path = Path(logfile) if logfile is not None else LOG_PATH
+    if not path.exists():
+        print(f"No log found at {path}")
         return
 
     iters = []
-    with LOG_PATH.open() as f:
+    with path.open() as f:
         for line in f:
             line = line.strip()
             if line:
                 iters.append(json.loads(line))
+
+    meta = next((it for it in iters if it.get("run_id")), None)
+    if meta:
+        print(f"Run {meta.get('run_number')} (id {meta.get('run_id')}, "
+              f"started {meta.get('run_started')})")
 
     def fmt_primary(entry, split):
         v = (entry.get("metrics") or {}).get(split, {}).get("primary")
