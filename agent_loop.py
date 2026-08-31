@@ -60,8 +60,8 @@ PROTECT_BEST_SUBMISSION = True
 
 # Fill in MODEL once you've checked GET /v1/models for what's available.
 MODEL = "qwen3-coder-next"
-API_BASE_URL = os.environ.get("SOCLAAS_BASE_URL")
-API_KEY = os.environ.get("SOCLAAS_API_KEY")
+API_BASE_URL = os.environ.get("API_BASE_URL")
+API_KEY = os.environ.get("API_KEY")
 
 client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
