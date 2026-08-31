@@ -19,8 +19,10 @@ load_dotenv()  # reads .env in the current working directory into os.environ
 
 ROOT = Path(__file__).parent
 WORKDIR = ROOT / "workdir"
-LOG_PATH = ROOT / "run_log.jsonl"   # the CURRENT run only (overwritten each run)
-RUNS_DIR = ROOT / "runs"            # permanent archive: runs/run_log_<n>_<timestamp>.jsonl
+LOG_PATH = ROOT / "run_log.jsonl"   # the LATEST run only (overwritten each run)
+RUNS_DIR = ROOT / "runs"            # committed archive of every run
+RUNS_INDEX_PATH = RUNS_DIR / "runs_index.json"     # accumulating machine-readable
+RUN_SUMMARY_MD_PATH = RUNS_DIR / "run_summary.md"  # accumulating human-readable
 BEST_CODE_PATH = ROOT / "best_pipeline.py"
 BEST_TEST_SCORES_PATH = ROOT / "best_test_scores.npy"
 SUBMISSION_PATH = ROOT / "submission.csv"
@@ -1018,16 +1020,17 @@ def main():
     print()
     summary = print_run_summary()
     print()
+    outcome = finalize_submission(summary, incumbent_test_primary, restore_dir)
+    print()
     try:
-        for label, p in _write_run_summary_files(
+        for label, p in _append_run_summary(
                 run_id, run_number, run_started, summary, verdict,
-                wall_sec, llm_iters, len(history), in_tok, out_tok):
+                wall_sec, llm_iters, len(history), in_tok, out_tok,
+                outcome, incumbent_test_primary):
             print(f"{label}: {p}")
     except Exception as e:  # noqa: BLE001 -- a summary-file failure must not
         # discard an otherwise-complete run.
-        print(f"Run-summary files not written (run is otherwise complete): {e}")
-    print()
-    finalize_submission(summary, incumbent_test_primary, restore_dir)
+        print(f"Run-summary file not updated (run is otherwise complete): {e}")
 
 
 def write_submission_csv():
@@ -1227,9 +1230,12 @@ def print_run_summary(logfile: Optional[Path] = None):
 
 # ---- Submission protection --------------------------------------------------
 
-# The files a run overwrites that you might want to submit / keep committed.
+# All four are snapshotted before a run. On a rollback only the SUBMISSION files
+# are restored -- run_log.jsonl deliberately stays as the LATEST run's (it is the
+# tracked "current representative run", distinct from the best-kept submission).
 _PROTECTED_FILES = ("submission.csv", "best_pipeline.py", "run_log.jsonl",
                     "best_test_scores.npy")
+_SUBMISSION_FILES = ("submission.csv", "best_pipeline.py", "best_test_scores.npy")
 
 
 def _score_submission_test(path: Path) -> Optional[float]:
@@ -1257,8 +1263,9 @@ def _score_submission_test(path: Path) -> Optional[float]:
 
 def snapshot_incumbent(restore_dir: Path) -> Optional[float]:
     """Copy the submission-critical files aside (byte copies) and return the
-    incumbent's best test primary from the not-yet-truncated run_log.jsonl."""
-    incumbent = best_logged_test_primary()
+    incumbent submission.csv's test primary, scored directly -- run_log.jsonl is
+    the LATEST run and may not be the run behind the submission."""
+    incumbent = _score_submission_test(SUBMISSION_PATH)
     restore_dir.mkdir(parents=True, exist_ok=True)
     saved = []
     for name in _PROTECTED_FILES:
@@ -1269,18 +1276,19 @@ def snapshot_incumbent(restore_dir: Path) -> Optional[float]:
     where = restore_dir.relative_to(ROOT)
     if incumbent is not None:
         print(f"Protection ON -- snapshotted {', '.join(saved) or 'nothing'} to {where}; "
-              f"incumbent test primary = {incumbent:.4f}")
+              f"incumbent submission test primary = {incumbent:.4f}")
     else:
         print(f"Protection ON -- snapshotted {', '.join(saved) or 'nothing'} to {where}; "
-              f"no prior score to compare (any result will be kept)")
+              f"no scorable incumbent submission (any result will be kept)")
     return incumbent
 
 
 def finalize_submission(summary, incumbent_test_primary: Optional[float],
-                        restore_dir: Path):
-    """Keep this run's submission if it beat the incumbent, otherwise roll the
-    submission-critical files back to the pre-run snapshot. The run's own log
-    archive and run_summary files under runs/ are left in place either way."""
+                        restore_dir: Path) -> str:
+    """Keep this run's submission if it STRICTLY beat the incumbent, else roll
+    submission.csv / best_pipeline.py / best_test_scores.npy back to the pre-run
+    snapshot. run_log.jsonl is NOT rolled back -- it stays as the latest run's.
+    Returns one of: "kept", "kept_no_incumbent", "kept_unprotected", "rolled_back"."""
     new_best_test = (summary or {}).get("best_test_primary")
     guarding = (PROTECT_BEST_SUBMISSION and incumbent_test_primary is not None
                 and restore_dir.exists())
@@ -1289,9 +1297,10 @@ def finalize_submission(summary, incumbent_test_primary: Optional[float],
                      or new_best_test <= incumbent_test_primary + 1e-9):
         got = f"{new_best_test:.4f}" if new_best_test is not None else "none"
         print(f"\nThis run's best test primary ({got}) did NOT beat the incumbent "
-              f"({incumbent_test_primary:.4f}). Restoring submission-critical files "
-              f"from {restore_dir.relative_to(ROOT)}:")
-        for name in _PROTECTED_FILES:
+              f"submission ({incumbent_test_primary:.4f}). Restoring the submission "
+              f"files from {restore_dir.relative_to(ROOT)} (run_log.jsonl stays as "
+              f"this run's):")
+        for name in _SUBMISSION_FILES:
             src, dst = restore_dir / name, ROOT / name
             if src.exists():
                 dst.write_bytes(src.read_bytes())
@@ -1299,8 +1308,8 @@ def finalize_submission(summary, incumbent_test_primary: Optional[float],
             elif dst.exists():
                 dst.unlink()  # incumbent had none of this file -- drop this run's
                 print(f"  removed {name} (incumbent had none)")
-        print(f"This run's log is still at the runs/ archive; nothing is lost.")
-        return
+        print("This run's full log is in the runs/ archive and runs/run_summary.md -- nothing lost.")
+        return "rolled_back"
 
     try:
         write_submission_csv()
@@ -1315,8 +1324,11 @@ def finalize_submission(summary, incumbent_test_primary: Optional[float],
         print(f"\nThis run beat the incumbent ({new_best_test:.4f} > "
               f"{incumbent_test_primary:.4f}). Submission files updated; previous "
               f"versions saved at {restore_dir.relative_to(ROOT)}.")
-    elif PROTECT_BEST_SUBMISSION and incumbent_test_primary is None:
-        print("\n(No prior submission to protect -- kept this run's output.)")
+        return "kept"
+    if PROTECT_BEST_SUBMISSION and incumbent_test_primary is None:
+        print("\n(No scorable prior submission to protect -- kept this run's output.)")
+        return "kept_no_incumbent"
+    return "kept_unprotected"
 
 
 def preflight():
@@ -1334,7 +1346,8 @@ def preflight():
     print(f"  run_log.jsonl best test primary (recorded): "
           f"{logged:.4f}" if logged is not None else "  run_log.jsonl best test primary (recorded): n/a")
     if sc is not None and logged is not None and abs(sc - logged) > 5e-4:
-        print("  ⚠️ submission.csv and run_log.jsonl disagree -- they may be from different runs")
+        print("  note: submission.csv is the best-KEPT result, run_log.jsonl is the "
+              "LATEST run -- they can legitimately differ under this layout")
 
     try:
         out = subprocess.run(
@@ -1352,27 +1365,33 @@ def preflight():
         print("  (git status check skipped -- not a git repo or git unavailable)")
 
     mode = "ON" if PROTECT_BEST_SUBMISSION else "OFF"
-    if PROTECT_BEST_SUBMISSION and (sc is not None or logged is not None):
-        ref = logged if logged is not None else sc
+    ref = sc if sc is not None else logged
+    if PROTECT_BEST_SUBMISSION and ref is not None:
         print(f"\nProtection mode: {mode} -- a run whose best test primary is <= "
-              f"{ref:.4f} will auto-restore submission.csv / best_pipeline.py / run_log.jsonl.")
+              f"{ref:.4f} will auto-restore submission.csv / best_pipeline.py / "
+              f"best_test_scores.npy (run_log.jsonl keeps the latest run).")
     else:
         print(f"\nProtection mode: {mode}.")
 
 
-def _write_run_summary_files(run_id, run_number, run_started, summary, verdict,
-                             wall_sec, llm_iters, iterations_logged, in_tok, out_tok):
-    """Write ROOT/run_summary_<run_id>.{txt,json}. Returns [(label, Path), ...]."""
+def _append_run_summary(run_id, run_number, run_started, summary, verdict,
+                        wall_sec, llm_iters, iterations_logged, in_tok, out_tok,
+                        outcome, incumbent_test_primary):
+    """Append this run to runs/runs_index.json and regenerate runs/run_summary.md
+    -- ONE accumulating human-readable file, newest run first, with a
+    'Best result so far' line on top. Returns [(label, Path), ...]."""
     summary = summary or {}
-    txt_path = ROOT / f"run_summary_{run_id}.txt"
-    json_path = ROOT / f"run_summary_{run_id}.json"
+    RUNS_DIR.mkdir(exist_ok=True)
 
-    txt_path.write_text((summary.get("text") or "(no run summary text)") + "\n")
+    n_signals = (len(verdict["intervention_signals_detected"])
+                 + (1 if verdict["own_source_modified_during_run"] else 0)
+                 + (1 if verdict["unaccounted_wall_clock_gap_exceeds_threshold"] else 0))
 
-    payload = {
+    record = {
         "run_number": run_number,
         "run_id": run_id,
         "run_started": run_started,
+        "submission_outcome": outcome,
         "best_iteration_index": summary.get("best_index"),
         "best_valid_primary": summary.get("best_valid_primary"),
         "best_test_primary": summary.get("best_test_primary"),
@@ -1381,22 +1400,73 @@ def _write_run_summary_files(run_id, run_number, run_started, summary, verdict,
         "iterations_logged": iterations_logged,
         "iterations_cap": MAX_ITERATIONS - 1,
         "tokens": {
-            "prompt": in_tok,
-            "completion": out_tok,
-            "total": in_tok + out_tok,
+            "prompt": in_tok, "completion": out_tok, "total": in_tok + out_tok,
             "calls": _TOKEN_TOTALS["calls"],
             "calls_without_usage": _TOKEN_TOTALS["calls_without_usage"],
         },
         "wall_clock_seconds": round(wall_sec, 1),
+        "manual_intervention_signals": n_signals,
+        "manual_intervention_summary": verdict["summary"],
         "own_source_modified_during_run": verdict["own_source_modified_during_run"],
         "intervention_signals_detected": verdict["intervention_signals_detected"],
         "unaccounted_wall_clock_gap_seconds": verdict["unaccounted_wall_clock_gap_seconds"],
         "unaccounted_wall_clock_gap_exceeds_threshold": verdict["unaccounted_wall_clock_gap_exceeds_threshold"],
-        "manual_intervention_summary": verdict["summary"],
+        "summary_text": summary.get("text") or "",
         "iterations": summary.get("iterations", []),
     }
-    json_path.write_text(json.dumps(payload, indent=2))
-    return [("Run summary (text)", txt_path), ("Run summary (json)", json_path)]
+
+    index = []
+    if RUNS_INDEX_PATH.exists():
+        try:
+            loaded = json.loads(RUNS_INDEX_PATH.read_text())
+            index = loaded if isinstance(loaded, list) else []
+        except ValueError:
+            index = []
+    index = [r for r in index if r.get("run_id") != run_id]  # replace on a re-run
+    index.append(record)
+    RUNS_INDEX_PATH.write_text(json.dumps(index, indent=2))
+
+    kept = [r for r in index
+            if str(r.get("submission_outcome", "")).startswith("kept")
+            and r.get("best_test_primary") is not None]
+    if kept:
+        b = max(kept, key=lambda r: r["best_test_primary"])
+        best_line = (f"**Best result so far:** test primary {b['best_test_primary']:.4f} "
+                     f"(valid {b['best_valid_primary']:.4f}) -- run {b['run_number']} "
+                     f"(`{b['run_id']}`)")
+    elif incumbent_test_primary is not None:
+        best_line = (f"**Best result so far:** test primary {incumbent_test_primary:.4f} "
+                     f"-- committed submission.csv, from a run predating this tracking")
+    else:
+        best_line = "**Best result so far:** none recorded yet"
+
+    md = ["# Agent run summaries", "",
+          f"_KuaiRand-Pure autonomous agent -- {len(index)} run(s) recorded, newest first._",
+          "", best_line, ""]
+    for r in sorted(index, key=lambda r: r.get("run_id", ""), reverse=True):
+        t = r["tokens"]
+        lb = "  [some calls lacked usage -- LOWER BOUND]" if t["calls_without_usage"] else ""
+        md += [
+            "---", "",
+            f"## Run {r['run_number']} -- `{r['run_id']}` -- {r['submission_outcome']}",
+            f"_started {r['run_started']}_", "",
+            f"- Best: valid {r['best_valid_primary']} / test {r['best_test_primary']} "
+            f"(iteration {r['best_iteration_index']}); baseline valid {r['baseline_valid_primary']}",
+            f"- Iterations: {r['iterations_used']} used (cap {r['iterations_cap']}), "
+            f"{r['iterations_logged']} logged incl. bootstrap",
+            f"- Wall-clock: {r['wall_clock_seconds']}s ({r['wall_clock_seconds'] / 60:.1f} min)",
+            f"- Tokens: {t['total']:,} total ({t['prompt']:,} in + {t['completion']:,} out) "
+            f"over {t['calls']} LLM calls{lb}",
+            f"- Manual interventions detected: {r['manual_intervention_signals']} "
+            f"-- {r['manual_intervention_summary']}",
+            f"- Full per-iteration log with code diffs: "
+            f"`runs/run_log_{r['run_number']:03d}_{r['run_id']}.jsonl`",
+            "", "```",
+            r.get("summary_text") or "(no summary text)",
+            "```", "",
+        ]
+    RUN_SUMMARY_MD_PATH.write_text("\n".join(md))
+    return [("Run summary (md)", RUN_SUMMARY_MD_PATH), ("Runs index (json)", RUNS_INDEX_PATH)]
 
 
 if __name__ == "__main__":
