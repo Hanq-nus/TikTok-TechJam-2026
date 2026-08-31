@@ -16,3 +16,10 @@ workdir/submit.py
 workdir/test_scores.npy
 # per-iteration LLM scratch, rewritten every iteration
 workdir/candidate_pipeline.py
+
+# Per-run local artifacts. run_log.jsonl (root) stays tracked as the single
+# representative iteration-log deliverable; these are the full local archive and
+# per-run summaries -- one set per run, not meant for the repo.
+runs/
+run_summary_*.txt
+run_summary_*.json
