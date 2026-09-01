@@ -1,8 +1,8 @@
 # Agent run summaries
 
-_KuaiRand-Pure autonomous agent -- 13 run(s) recorded, newest first._
+_KuaiRand-Pure autonomous agent -- 14 run(s) recorded, newest first. Runs are selected on VALIDATION primary; the local test primary is shown for reference only._
 
-**Best result so far:** test primary 0.5975 (valid 0.6040) -- run 12 (`20260901T064700`)
+**Best result so far (selected on validation):** valid 0.6043 / test 0.5970 -- run 0 (`00000000T000000`)
 
 ---
 
@@ -67,7 +67,7 @@ Best so far: iteration 19 (valid primary 0.6032, baseline was 0.6015)
 
 ---
 
-## Run 12 -- `20260901T064700` -- kept
+## Run 12 -- `20260901T064700` -- reverted (kept by an earlier test-based check; validation < incumbent 0.6043)
 _started 2026-09-01T06:47:00_
 
 - Best: valid 0.604002833366394 / test 0.5974674224853516 (iteration 33); baseline valid 0.6014695167541504
@@ -308,7 +308,7 @@ Best so far: iteration 9 (valid primary 0.6030, baseline was 0.6015)
 
 ---
 
-## Run 9 -- `20260901T045859` -- kept
+## Run 9 -- `20260901T045859` -- reverted (kept by an earlier test-based check; validation < incumbent 0.6043)
 _started 2026-09-01T04:58:59_
 
 - Best: valid 0.6041654348373413 / test 0.5971359014511108 (iteration 22); baseline valid 0.6014695167541504
@@ -1131,4 +1131,20 @@ Run 1 (id 20260831T162609, started 2026-08-31T16:26:09)
 ------------------------------------------------------------------------------------------------------------
 27 iterations: 18 succeeded, 9 errored.
 Best so far: iteration 25 (valid primary 0.6032, baseline was 0.6015)
+```
+
+---
+
+## Run 0 -- `00000000T000000` -- kept
+_started (pre-tracking)_
+
+- Best: valid 0.6042686700820923 / test 0.5970227718353271 (iteration 24); baseline valid 0.6014695167541504
+- Iterations: 25 used (cap 49), 26 logged incl. bootstrap
+- Wall-clock: 0.0s (0.0 min)
+- Tokens: 0 total (0 in + 0 out) over 0 LLM calls
+- Manual interventions detected: 0 -- (not recorded -- this run predates intervention tracking)
+- Full per-iteration log with code diffs: `runs/run_log_000_00000000T000000.jsonl`
+
+```
+(this run's per-iteration table is in the committed run_log.jsonl; it predates the runs/ archive and code-diff logging)
 ```

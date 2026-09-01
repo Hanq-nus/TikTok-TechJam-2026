@@ -15,19 +15,20 @@ accepts it as the new best, rejects it (including two dedicated guards
 against data leakage — see Limitations), or logs the failure and continues —
 entirely without human intervention during the run.
 
-Final result: validation primary **0.6040**, hidden-test primary **0.5975**,
-vs. the official baseline's 0.5946 (delta **+0.0029**), independently
-verified via the organizers' own `submit.py --score`. The winning pipeline
-adds a **train-only per-user long-view rate**, bucketed into 6 bins, as an
-extra FM field — so it interacts with the item-side embeddings (the kit's
-own note that user features only help ranking *through* such interactions),
-computed strictly from each user's training rows and looked up by
-`user_id`, with unseen users falling into a shared UNK bucket. On top of
-that sit a trained per-bucket scalar offset and per-user bias/temperature
-terms (rank-neutral calibration). Earlier the agent kept abandoning this
-direction after one or two flat iterations; letting it keep refining a
-direction that already holds the running best is what carried it past the
-prior calibration-only plateau at 0.5970.
+Final result: validation primary **0.6043**, hidden-test primary **0.5970**,
+vs. the official baseline's 0.5946 (delta **+0.0024**), independently
+verified via the organizers' own `submit.py --score`. The winning change was
+a contrastive margin-scaled gradient (reweighting the pointwise loss by the
+signed margin `y·z`) combined with recency-weighted training samples —
+targeting the loss/metric mismatch between pointwise training and the
+rank-based GAUC/nDCG@5 scoring.
+
+The submitted pipeline is chosen by **validation** primary. Later runs
+produced a train-only per-user long-view-rate feature that scored slightly
+higher on the *local* test split (up to 0.5975), but not on validation
+(≤ 0.6040 vs. 0.6043, within the ε = 0.002 noise band). Picking across runs
+by a test score you would not have in the real hidden-test setting is not
+valid model selection, so those runs were not adopted — see Limitations.
 
 ## Setup and installation
 
@@ -77,7 +78,7 @@ On completion the agent writes `submission.csv`, updates `run_summary.md` /
 
 `best_pipeline.py` is a static file once selected — training uses a fixed
 numpy seed, so re-running it reproduces the exact submitted numbers
-(`valid 0.6040 / test 0.5975`). It imports `data.py` / `evaluate.py` from
+(`valid 0.6043 / test 0.5970`). It imports `data.py` / `evaluate.py` from
 `workdir/`, so run it with that on the path:
 
 ```bash
@@ -88,7 +89,7 @@ Or verify the committed submission file directly:
 
 ```bash
 python3 submit.py --check --split test submission.csv   # format + row alignment
-python3 submit.py --score --split test submission.csv   # should reprint test primary 0.5975
+python3 submit.py --score --split test submission.csv   # should reprint test primary 0.5970
 ```
 
 (Note: this reproduces the *result*. The *search* that found it isn't
@@ -97,12 +98,18 @@ can explore freely; see Limitations.)
 
 ## Limitations and what I'd improve with more time
 
-- **Run-to-run search variance.** The LLM proposal step is unseeded on
-  purpose, so each full run is a genuinely different search and isn't
-  guaranteed to rediscover the same result. Across ~13 full runs the
-  hidden-test primary ranged roughly 0.594–0.5975; the submitted pipeline
-  is the best of those, kept automatically by the submission-protection
-  layer, and independently re-verified.
+- **Run-to-run search variance, and model selection is on validation.** The
+  LLM proposal step is unseeded on purpose, so each full run is a genuinely
+  different search and isn't guaranteed to rediscover the same result.
+  Across ~14 full runs the validation primary clustered at 0.602–0.6043
+  (test 0.594–0.5975). The submitted pipeline is the run with the highest
+  **validation** primary — the only criterion available in the real
+  hidden-test setting. An earlier version of the submission-protection layer
+  compared whole runs on the *local* test primary and briefly adopted a run
+  that scored 0.5975 on local test but only 0.6040 on validation (below the
+  incumbent's 0.6043, and within noise); that was reverted, and the
+  protection layer now compares runs on validation primary. `run_summary.md`
+  records every run and shows local test for reference only.
 - **Two rounds of data leakage were caught and fixed, not just theorized
   about.** A validation-vs-test primary gap guard was added after one run's
   best-looking candidate turned out to be leaking (a same-split expanding
@@ -116,18 +123,19 @@ can explore freely; see Limitations.)
   implausibly larger than any legitimate gain observed across the project.
   A submission-protection layer now also prevents a future run from
   silently overwriting a better, already-committed result.
-- **User-history modeling only started paying off once the loop was allowed
-  to *refine* it.** The first working, non-leaky version of a train-only
-  per-user rate feature (now in the winning pipeline) still only adds
-  ~+0.0005 test primary. Two things held it back for most of the project:
-  the leakage-prone obvious implementations (reading valid/test labels),
-  which the guards now reject; and an anti-repetition rule that forced the
-  agent off a direction after two flat iterations, before it could tune the
-  bins / decay / field encoding. With more time I'd push this further —
-  proper sequence features (per-impression EMA rate, recency gaps) rather
-  than a single static bucket — and revisit multi-task learning with the
-  auxiliary signals (`is_click`, `is_like`, …), which never produced a
-  verified gain.
+- **User-history / sequence modeling and multi-task learning never produced
+  a verified gain on validation.** The kit's own analysis flags these as the
+  most promising unexplored directions. The agent repeatedly tried a
+  train-only per-user long-view-rate feature; the non-leaky versions moved
+  validation primary by at most noise (≤ 0.6040 vs. 0.6043). Two things held
+  the direction back: the leakage-prone obvious implementations (reading
+  valid/test labels), which the guards reject; and — until late — an
+  anti-repetition rule that forced the agent off a direction after two flat
+  iterations, before it could tune the bins / decay / field encoding (a
+  direction that already holds the running best is now exempt). With more
+  time I'd push proper sequence features (per-impression EMA rate, recency
+  gaps) and multi-task heads on the auxiliary signals (`is_click`,
+  `is_like`, …) rather than a single static bucket.
 - **No live web search for external methods.** The agent draws on the LLM's
   own training knowledge of published techniques (BPR, listwise ranking,
   etc.) rather than searching for papers at run time — a deliberate scope
