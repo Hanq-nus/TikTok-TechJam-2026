@@ -7,7 +7,7 @@ Agent for Recommender Systems).
 
 `agent_loop.py` runs an autonomous propose → execute → evaluate → reflect loop
 against the official KuaiRand-Pure starter kit. Each iteration, an LLM
-(`qwen3-coder-next`, via an OpenAI-compatible endpoint) is shown the current
+(set via `.env`; `qwen3-coder-next` for this submission) is shown the current
 best pipeline's real source code, a ground-truth profile of the dataset, and
 recent iteration history, then proposes one focused code change. The
 candidate is executed against the organizers' own fixed evaluator; the loop
@@ -42,7 +42,11 @@ Create a `.env` file in the project root:
 ```
 API_KEY=your-key-here
 API_BASE_URL=your-endpoint-base-url-here
+MODEL=your-model-name
 ```
+
+`MODEL` is any chat model your OpenAI-compatible endpoint exposes; the loop
+is model-agnostic. For this challenge, `qwen3-coder-next` was used.
 
 Place the official starter kit files directly in `workdir/`: `data.py`,
 `evaluate.py`, `baseline.py`, `submit.py` — unmodified, exactly as provided.

@@ -64,7 +64,8 @@ LARGE_JUMP_THRESHOLD = 0.015
 # the run always overwrites those files.
 PROTECT_BEST_SUBMISSION = True
 
-MODEL = "qwen3-coder-next"
+# LLM + endpoint, all from .env.
+MODEL = os.environ.get("MODEL")
 API_BASE_URL = os.environ.get("API_BASE_URL")
 API_KEY = os.environ.get("API_KEY")
 
