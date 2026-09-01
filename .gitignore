@@ -21,3 +21,6 @@ workdir/candidate_pipeline.py
 # run_summary.json (root) accumulate across runs; runs/ holds every run's full
 # per-iteration archive. Only the rollback scratch is ignored.
 runs/_incumbent_*/
+
+# stray copy from running best_pipeline.py outside workdir/
+/test_scores.npy
